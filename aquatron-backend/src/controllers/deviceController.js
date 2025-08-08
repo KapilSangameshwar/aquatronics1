@@ -7,7 +7,7 @@ const {
   CMD_GET_DEVICE_SETTINGS
 } = require('../services/deviceComm');
 
-const TestLog = require('../models/Testlog'); // ✅ New import
+const TestLog = require('../models/HistoryLog'); // ✅ New import
 
 // Helper to convert hex string to Buffer
 function hexToBuffer(hex) {

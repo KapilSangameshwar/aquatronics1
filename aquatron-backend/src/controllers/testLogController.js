@@ -1,4 +1,4 @@
-const TestLog = require('../models/Testlog');
+const TestLog = require('../models/HistoryLog');
 
 exports.getUserLogs = async (req, res) => {
   try {
