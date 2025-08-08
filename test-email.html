@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <h2>Test Backend Email</h2>
+  <input id="email" placeholder="Enter email" style="width: 300px; padding: 8px;" />
+  <button onclick="sendTestEmail()" style="padding: 8px 16px;">Send Test Email</button>
+  <pre id="result" style="margin-top: 20px; background: #f0f0f0; padding: 10px;"></pre>
+  <script>
+    function sendTestEmail() {
+      const email = document.getElementById('email').value;
+      fetch('http://localhost:5000/api/auth/test-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      })
+      .then(res => res.json())
+      .then(data => document.getElementById('result').textContent = JSON.stringify(data, null, 2))
+      .catch(err => document.getElementById('result').textContent = err);
+    }
+  </script>
+</body>
+</html>
