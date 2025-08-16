@@ -29,18 +29,55 @@ exports.getDeviceStatus = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// Helper: build payload for CMD_SEND_SW_PARAMETERS
+// Static lookup table for vout_base and freq
+const ELEMENT_PROFILES = {
+  Li: { vout_base: 3.71, freq: 2226 },
+  Ca: { vout_base: 2.95, freq: 1765 },
+  Na: { vout_base: 3.032, freq: 1818 },
+  Cl: { vout_base: 3.916, freq: 2351 },
+  Fe: { vout_base: 4.558, freq: 2739 },
+  Zn: { vout_base: 4.167, freq: 2504 },
+  Cu: { vout_base: 4.557, freq: 2739 },
+  Pb: { vout_base: 3.321, freq: 1988 },
+  Mg: { vout_base: 3.63, freq: 2175 },
+  Mn: { vout_base: 4.497, freq: 2697 },
+  Cd: { vout_base: 3.711, freq: 2228 },
+  K:  { vout_base: 2.454, freq: 1466 },
+  B:  { vout_base: 5.256, freq: 3161 },
+  F:  { vout_base: 3.896, freq: 2340 },
+  Mo: { vout_base: 4.147, freq: 2486 },
+  Ni: { vout_base: 4.661, freq: 2797 },
+  Se: { vout_base: 3.423, freq: 2052 },
+  Si: { vout_base: 3.814, freq: 2287 },
+  Ag: { vout_base: 4.043, freq: 2428 },
+  As: { vout_base: 3.711, freq: 2228 },
+  Hg: { vout_base: 3.568, freq: 2140 },
+  P:  { vout_base: 3.402, freq: 2041 },
+  Al: { vout_base: 4.065, freq: 2439 },
+  Cr: { vout_base: 1.343, freq: 797 },
+  Co: { vout_base: 4.66, freq: 2797 },
+  Ba: { vout_base: 2.598, freq: 1554 },
+  Am: { vout_base: 3.341, freq: 1999 },
+  NO: { vout_base: 4.660, freq: 2797 }
+};
+
+// Helper: build payload for CMD_SEND_SW_PARAMETERS (now includes vout_base and freq)
 function buildSWParametersPayload(elements) {
   if (!Array.isArray(elements) || elements.length < 1 || elements.length > 30) {
     throw new Error('Invalid elements array (must be 1-30)');
   }
-  const payload = Buffer.alloc(1 + elements.length * 4);
+  // Each element: 2 bytes symbol, 2 bytes quantity, 4 bytes vout_base (float), 4 bytes freq (uint32)
+  const payload = Buffer.alloc(1 + elements.length * (2 + 2 + 4 + 4));
   payload[0] = elements.length;
   elements.forEach((el, i) => {
-    payload[1 + i * 4] = el.symbol.charCodeAt(0);
-    payload[2 + i * 4] = el.symbol.charCodeAt(1);
-    payload[3 + i * 4] = el.quantity & 0xFF;
-    payload[4 + i * 4] = (el.quantity >> 8) & 0xFF;
+    const symbol = el.symbol || '';
+    const profile = ELEMENT_PROFILES[symbol] || { vout_base: 0, freq: 0 };
+    const base = 1 + i * 12;
+    payload[base] = symbol.charCodeAt(0) || 0;
+    payload[base + 1] = symbol.charCodeAt(1) || 0;
+    payload.writeUInt16LE(el.quantity || 0, base + 2);
+    payload.writeFloatLE(profile.vout_base, base + 4);
+    payload.writeUInt32LE(profile.freq, base + 8);
   });
   return payload;
 }
