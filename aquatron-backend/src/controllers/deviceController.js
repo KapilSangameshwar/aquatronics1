@@ -31,8 +31,8 @@ exports.getDeviceStatus = async (req, res, next) => {
 
 // Helper: build payload for CMD_SEND_SW_PARAMETERS
 function buildSWParametersPayload(elements) {
-  if (!Array.isArray(elements) || elements.length < 1 || elements.length > 5) {
-    throw new Error('Invalid elements array');
+  if (!Array.isArray(elements) || elements.length < 1 || elements.length > 30) {
+    throw new Error('Invalid elements array (must be 1-30)');
   }
   const payload = Buffer.alloc(1 + elements.length * 4);
   payload[0] = elements.length;
