@@ -318,13 +318,16 @@ exports.sendSWParameters = async (req, res, next) => {
             elements: req.body.elements,
             transport: preferredTransport || currentTransportMode
           },
-          elements: req.body.elements.map(el => ({
-            symbol: el.symbol,
-            name: el.name || el.symbol, // Use symbol as name if not provided
-            quantity: el.quantity || 0,
-            vout_base: el.vout_base || 0,
-            freq: el.freq || 0
-          })),
+          elements: req.body.elements.map(el => {
+            const profile = ELEMENT_PROFILES[el.symbol] || { vout_base: 0, freq: 0 };
+            return {
+              symbol: el.symbol,
+              name: el.name || el.symbol, // Use symbol as name if not provided
+              quantity: el.quantity || 0,
+              vout_base: profile.vout_base,
+              freq: profile.freq
+            };
+          }),
           transportMode: preferredTransport || currentTransportMode,
           deviceResponse: {
             success: result.success !== false,
