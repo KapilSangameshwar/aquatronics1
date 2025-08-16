@@ -27,7 +27,7 @@ router.post(
 
 router.post("/send-otp", otpController.sendOTP);
 router.post("/verify-otp", otpController.verifyOTP);
-// router.post("/reset-password", otpController.resetPassword); // Not implemented
+router.post("/reset-password", otpController.resetPassword);
 // router.post("/test-email", otpController.testEmail); // Not implemented
 
 module.exports = router;

@@ -5,8 +5,13 @@ const {
   sendDeviceCommand,
   getDeviceSettings,
   setDeviceSettings,
-  sendSWParameters
+  sendSWParameters,
+  requestDeviceReady,
+  sendDebugPacket,
+  getTransportMode,
+  setTransportMode
 } = require('../controllers/deviceController');
+const { getTransportStatus } = require('../services/deviceComm');
 const router = express.Router();
 
 // Get device status (heartbeat/ready)
@@ -25,6 +30,27 @@ router.post('/settings', authenticate, authorize(['superadmin', 'admin']), (req,
 });
 
 // Send software parameters (elements)
-router.post('/sw-parameters', authenticate, authorize(['superadmin', 'admin', 'user']), sendSWParameters);
+router.post('/sw-parameters', authenticate, authorize(['superadmin', 'admin', 'user']), (req, res, next) => {
+  console.log('🔍 ROUTE: /sw-parameters hit');
+  console.log('🔍 Request body:', req.body);
+  console.log('🔍 User:', req.user);
+  console.log('🔍 Calling sendSWParameters controller...');
+  sendSWParameters(req, res, next);
+});
+
+// Request device ready status
+router.post('/ready', authenticate, authorize(['superadmin', 'admin', 'user']), requestDeviceReady);
+
+// Debug panel - send custom packets (superadmin only)
+router.post('/debug', authenticate, authorize(['superadmin']), sendDebugPacket);
+
+// Transport status (ws/tcp/serial)
+router.get('/transport-status', authenticate, authorize(['superadmin', 'admin', 'user']), (req, res) => {
+  res.json(getTransportStatus());
+});
+
+// Transport mode (auto | wifi | uart | tcp)
+router.get('/transport-mode', authenticate, authorize(['superadmin', 'admin', 'user']), getTransportMode);
+router.post('/transport-mode', authenticate, authorize(['superadmin', 'admin']), setTransportMode);
 
 module.exports = router;

@@ -23,3 +23,27 @@ exports.deleteUser = async (req, res, next) => {
     res.json({ message: 'User deleted' });
   } catch (err) { next(err); }
 };
+
+exports.createUser = async (req, res, next) => {
+  try {
+    const { username, email, password, role } = req.body;
+    
+    // Check if user already exists
+    const userExists = await User.findOne({ $or: [{ email }, { username }] });
+    if (userExists) {
+      return res.status(400).json({ message: "User already exists" });
+    }
+
+    // Role restrictions
+    if (req.user.role === 'admin' && role === 'superadmin') {
+      return res.status(403).json({ message: "Admins cannot create superadmin users" });
+    }
+
+    const user = new User({ username, email, password, role });
+    await user.save();
+
+    res.status(201).json({ message: "User created successfully", user: { username, email, role } });
+  } catch (err) { 
+    next(err); 
+  }
+};

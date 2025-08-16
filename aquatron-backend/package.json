@@ -17,7 +17,8 @@
     "mongoose": "^8.3.2",
     "nodemailer": "^7.0.5",
     "serialport": "^11.0.0",
-    "socket.io": "^4.7.5"
+    "socket.io": "^4.7.5",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
