@@ -66,18 +66,15 @@ function buildSWParametersPayload(elements) {
   if (!Array.isArray(elements) || elements.length < 1 || elements.length > 30) {
     throw new Error('Invalid elements array (must be 1-30)');
   }
-  // Each element: 2 bytes symbol, 2 bytes quantity, 4 bytes vout_base (float), 4 bytes freq (uint32)
-  const payload = Buffer.alloc(1 + elements.length * (2 + 2 + 4 + 4));
+  // Each element: 2 bytes symbol, 2 bytes quantity (total 4 bytes per element)
+  const payload = Buffer.alloc(1 + elements.length * 4);
   payload[0] = elements.length;
   elements.forEach((el, i) => {
     const symbol = el.symbol || '';
-    const profile = ELEMENT_PROFILES[symbol] || { vout_base: 0, freq: 0 };
-    const base = 1 + i * 12;
+    const base = 1 + i * 4;
     payload[base] = symbol.charCodeAt(0) || 0;
     payload[base + 1] = symbol.charCodeAt(1) || 0;
     payload.writeUInt16LE(el.quantity || 0, base + 2);
-    payload.writeFloatLE(profile.vout_base, base + 4);
-    payload.writeUInt32LE(profile.freq, base + 8);
   });
   return payload;
 }
@@ -114,21 +111,28 @@ exports.sendDeviceCommand = async (req, res, next) => {
       payload = buildDeviceSettingsPayload(settings);
     }
 
+    // Debug: Log command and transport
+    console.log('[DeviceController] Sending command:', cmd, 'Transport:', transport);
+    if (cmd === CMD_SEND_SW_PARAMETERS) {
+      console.log('[DeviceController] STP payload:', payload.toString('hex'));
+    }
+
     // ✅ For both SW_PARAMS and SETTINGS, send CMD_GET_DEVICE_READY first, then the command
     let result;
     if (cmd === CMD_SEND_SW_PARAMETERS || cmd === CMD_SET_DEVICE_SETTINGS) {
       // First send CMD_GET_DEVICE_READY to prompt microcontroller
       const readyPacket = buildPacket(CMD_GET_DEVICE_READY);
       sendPacket(readyPacket);
-      
+      console.log('[DeviceController] Sent CMD_GET_DEVICE_READY');
       // Wait a moment for the microcontroller to process the ready request
       await new Promise(resolve => setTimeout(resolve, 500));
-      
       // Then send the actual command
       result = await sendCommandToSTM32(cmd, payload, transport);
+      console.log('[DeviceController] Sent command result:', result);
     } else {
       // For other commands, send directly
       result = await sendCommandToSTM32(cmd, payload, transport);
+      console.log('[DeviceController] Sent command result:', result);
     }
 
     // ✅ Save log to DB if user is logged in
