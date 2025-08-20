@@ -47,6 +47,7 @@ const TestLog = require('../models/HistoryLog');
 const { SerialPort } = require('serialport');
 const net = require('net');
 const WebSocket = require('ws');
+const noble = require('@abandonware/noble');
 
 // STM32/ESP32 protocol constants
 const PKT_HEADER = 0xAA;
@@ -83,8 +84,72 @@ let serialBuffer = Buffer.alloc(0);
 let tcpBuffer = Buffer.alloc(0);
 let wsBuffer = Buffer.alloc(0);
 
-// Transport mode: 'auto' | 'wifi' | 'uart' | 'tcp'
+
+// Transport mode: 'auto' | 'wifi' | 'uart' | 'tcp' | 'bluetooth'
 let transportMode = 'auto';
+
+// BLE variables
+let blePeripheral = null;
+let bleCharacteristic = null;
+let bleConnected = false;
+let bleStatus = { connected: false, scanning: false, error: null };
+
+// Replace with your STM32 BLE UUIDs
+const SERVICE_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
+const CHARACTERISTIC_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
+function setupBLE(io) {
+  ioRef = io;
+  noble.on('stateChange', async (state) => {
+    if (state === 'poweredOn') {
+      bleStatus.scanning = true;
+      noble.startScanning([SERVICE_UUID], false);
+    } else {
+      noble.stopScanning();
+      bleStatus.scanning = false;
+    }
+  });
+
+  noble.on('discover', async (peripheral) => {
+    if (blePeripheral) return; // Already connected
+    blePeripheral = peripheral;
+    noble.stopScanning();
+    bleStatus.scanning = false;
+    peripheral.connect((err) => {
+      if (err) {
+        bleStatus.error = err.message;
+        io.emit('device-error', 'BLE connect error: ' + err.message);
+        return;
+      }
+      bleConnected = true;
+      bleStatus.connected = true;
+      io.emit('device-status', { online: true, via: 'bluetooth', status: 'ble_connected', timestamp: new Date().toISOString() });
+      peripheral.discoverSomeServicesAndCharacteristics([SERVICE_UUID], [CHARACTERISTIC_UUID], (err, services, characteristics) => {
+        if (err || !characteristics.length) {
+          bleStatus.error = err ? err.message : 'Characteristic not found';
+          io.emit('device-error', 'BLE discover error: ' + bleStatus.error);
+          return;
+        }
+        bleCharacteristic = characteristics[0];
+        // Subscribe to notifications
+        bleCharacteristic.on('data', (data, isNotification) => {
+          processIncomingBuffer(Buffer.from(data), 'bluetooth');
+        });
+        bleCharacteristic.subscribe((err) => {
+          if (err) io.emit('device-error', 'BLE subscribe error: ' + err.message);
+        });
+      });
+    });
+    peripheral.on('disconnect', () => {
+      bleConnected = false;
+      bleStatus.connected = false;
+      blePeripheral = null;
+      bleCharacteristic = null;
+      io.emit('device-status', { online: false, via: 'bluetooth', status: 'ble_disconnected', timestamp: new Date().toISOString() });
+      noble.startScanning([SERVICE_UUID], false);
+      bleStatus.scanning = true;
+    });
+  });
+}
 
 function normalizeTransportName(name) {
   if (!name) return undefined;
@@ -92,8 +157,12 @@ function normalizeTransportName(name) {
   if (n === 'wifi' || n === 'ws' || n === 'websocket') return 'wifi';
   if (n === 'uart' || n === 'serial' || n === 'com') return 'uart';
   if (n === 'tcp' || n === 'net') return 'tcp';
+  if (n === 'bluetooth' || n === 'ble') return 'bluetooth';
   if (n === 'auto') return 'auto';
   return undefined;
+function isBLEReady() {
+  return !!(bleCharacteristic && bleConnected);
+}
 }
 
 function isWsReady() {
@@ -546,12 +615,27 @@ function sendPacket(packet, preferredTransport) {
     if (isTcpReady()) { tcpClient.write(packet); return { sent: true, via: 'tcp' }; }
     return { sent: false, error: 'TCP not connected' };
   }
+  if (mode === 'bluetooth') {
+    if (isBLEReady()) {
+      bleCharacteristic.write(packet, false, (err) => {
+        if (err) ioRef.emit('device-error', 'BLE write error: ' + err.message);
+      });
+      return { sent: true, via: 'bluetooth' };
+    }
+    return { sent: false, error: 'Bluetooth not connected' };
+  }
 
-  // Auto mode: prefer WS -> TCP -> Serial
+  // Auto mode: prefer WS -> TCP -> Serial -> BLE
   if (isWsReady()) { wsClient.send(packet, { binary: true }); return { sent: true, via: 'ws' }; }
   if (isTcpReady()) { tcpClient.write(packet); return { sent: true, via: 'tcp' }; }
   if (isSerialReady()) { serialPort.write(packet); return { sent: true, via: 'serial' }; }
-  return { sent: false, error: 'No connection to STM32/ESP32' };
+  if (isBLEReady()) {
+    bleCharacteristic.write(packet, false, (err) => {
+      if (err) ioRef.emit('device-error', 'BLE write error: ' + err.message);
+    });
+    return { sent: true, via: 'bluetooth' };
+  }
+  return { sent: false, error: 'No connection to STM32/ESP32/BLE' };
 }
 
 function getTransportStatus() {
@@ -566,6 +650,11 @@ function getTransportStatus() {
     },
     serial: {
       connected: !!(serialPort && serialPort.isOpen)
+    },
+    bluetooth: {
+      connected: bleStatus.connected,
+      scanning: bleStatus.scanning,
+      error: bleStatus.error
     }
   };
 }
@@ -618,6 +707,7 @@ module.exports = {
   setupSerial,
   setupTCP,
   setupWS,
+  setupBLE,
   getDeviceStatusFromSTM32,
   sendCommandToSTM32,
   requestDeviceReady,
