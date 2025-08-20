@@ -1,3 +1,25 @@
+// Wait for CMD_FEEDBACK_INFO response and return parsed feedback info
+function getFeedbackInfoFromSTM32(preferredTransport) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Listen for feedback-info event ONCE
+      const timeout = setTimeout(() => {
+        if (ioRef) ioRef.off('feedback-info', handler);
+        reject(new Error('Timeout waiting for feedback info from STM32'));
+      }, 3000);
+      function handler(data) {
+        clearTimeout(timeout);
+        if (ioRef) ioRef.off('feedback-info', handler);
+        console.log('[FeedbackInfo] feedback-info event received:', data);
+        resolve(data); // Return the full structured object
+      }
+      if (ioRef) ioRef.on('feedback-info', handler);
+      await sendCommandToSTM32(CMD_GET_FEEDBACK_INFO, undefined, preferredTransport);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
 // Wait for CMD_DEVICE_SETTINGS response and return parsed settings
 function getDeviceSettingsFromSTM32(preferredTransport) {
   return new Promise(async (resolve, reject) => {
@@ -237,6 +259,11 @@ function handlePacket({ cmd, payload, len, source }) {
   switch (cmd) {
     case CMD_DEVICE_ONLINE:
       // ...existing code...
+
+      // DEBUG: Log all incoming binary packets from STM32/ESP32
+      function debugLogIncomingPacket(cmd, payload) {
+        console.log(`[DEBUG] Incoming packet: CMD=0x${cmd.toString(16).padStart(2, '0').toUpperCase()}, PayloadLen=${payload.length}, Raw=${payload.toString('hex')}`);
+      }
       const heartbeatData = {
         online: true, 
         payload: payload.toString('hex'),
@@ -283,78 +310,107 @@ function handlePacket({ cmd, payload, len, source }) {
       ioRef.emit('device-ack', { ack: true, payload: payload.toString('hex') });
       break;
     case CMD_DEVICE_SETTINGS: {
-      // Parse device settings payload
+      // Debug log for payload length and element count
+      console.log('[DeviceSettings] Raw payload:', payload.toString('hex'), 'Length:', payload.length);
       let pos = 0;
-      const freefall = payload.readInt16LE(pos); pos += 2;
-      const hptf = payload.readInt16LE(pos); pos += 2;
-      const feedback_enabled = payload.readUInt8(pos); pos += 1;
-      const feedback_tolerance = payload.readUInt8(pos) / 1000.0; pos += 1;
-      const harmonic_val = payload.readUInt8(pos); pos += 1;
-      const harmonic = harmonic_val === 1 ? 'HALF' : (harmonic_val === 2 ? 'QUARTER' : 'FULL');
-      const duration_ms = payload.readUInt16LE(pos); pos += 2;
-      const element_count = payload.readUInt8(pos); pos += 1;
-      const elements = [];
-      for (let i = 0; i < element_count && pos + 11 <= payload.length; i++) {
-        const symbol = payload.slice(pos, pos + 3).toString('ascii').replace(/\0+$/, ''); pos += 3;
-        const vout_base = payload.readFloatLE(pos); pos += 4;
-        const freq = payload.readUInt32LE(pos); pos += 4;
-        elements.push({ symbol, vout_base, freq });
+      try {
+        const freefall = payload.readInt16LE(pos); pos += 2;
+        const hptf = payload.readInt16LE(pos); pos += 2;
+        const feedback_enabled = payload.readUInt8(pos); pos += 1;
+        const feedback_tolerance = payload.readUInt8(pos) / 1000.0; pos += 1;
+        const harmonic_val = payload.readUInt8(pos); pos += 1;
+        const harmonic = harmonic_val === 1 ? 'HALF' : (harmonic_val === 2 ? 'QUARTER' : 'FULL');
+        const duration_ms = payload.readUInt16LE(pos); pos += 2;
+        const element_count = payload.readUInt8(pos); pos += 1;
+        console.log('[DeviceSettings] Parsed element_count:', element_count, 'pos after header:', pos);
+        const elements = [];
+        for (let i = 0; i < element_count; i++) {
+          if (pos + 11 > payload.length) {
+            console.error(`[DeviceSettings] Malformed payload: not enough bytes for element ${i+1} (pos=${pos}, payload.length=${payload.length})`);
+            break;
+          }
+          const symbol = payload.slice(pos, pos + 3).toString('ascii').replace(/\0+$/, ''); pos += 3;
+          const vout_base = payload.readFloatLE(pos); pos += 4;
+          const freq = payload.readUInt32LE(pos); pos += 4;
+          elements.push({ symbol, vout_base, freq });
+        }
+        ioRef.emit('device-settings', {
+          freefall,
+          hptf,
+          feedback_enabled: !!feedback_enabled,
+          feedback_tolerance,
+          harmonic,
+          duration_ms,
+          element_count,
+          elements,
+          raw: payload.toString('hex'),
+          timestamp: new Date().toISOString(),
+          source,
+        });
+      } catch (err) {
+        console.error('[DeviceSettings] Error parsing device settings payload:', err, 'Payload:', payload.toString('hex'));
+        ioRef.emit('device-settings', {
+          error: 'Malformed device settings payload',
+          raw: payload.toString('hex'),
+          timestamp: new Date().toISOString(),
+          source,
+        });
       }
-      ioRef.emit('device-settings', {
-        freefall,
-        hptf,
-        feedback_enabled: !!feedback_enabled,
-        feedback_tolerance,
-        harmonic,
-        duration_ms,
-        element_count,
-        elements,
-        raw: payload.toString('hex'),
-        timestamp: new Date().toISOString(),
-        source,
-      });
       break;
     }
     case CMD_FEEDBACK_INFO: {
+      debugLogIncomingPacket(CMD_FEEDBACK_INFO, payload);
       // Parse feedback info payload as per STM32 structure
-      let pos = 0;
-      const feedback_enabled = payload.readUInt8(pos); pos += 1;
-      const feedback_tolerance = payload.readFloatLE(pos); pos += 4;
-      const correction_factor = payload.readUInt8(pos) / 100.0; pos += 1;
-      const max_iterations = payload.readUInt8(pos); pos += 1;
-      const settle_delay = payload.readUInt16LE(pos); pos += 2;
-      const total_corrections = payload.readUInt32LE(pos); pos += 4;
-      const successful_corrections = payload.readUInt32LE(pos); pos += 4;
-      const failed_corrections = payload.readUInt32LE(pos); pos += 4;
-      const total_iterations = payload.readUInt32LE(pos); pos += 4;
-      const avg_error_before = payload.readFloatLE(pos); pos += 4;
-      const avg_error_after = payload.readFloatLE(pos); pos += 4;
-      const adc_vref = payload.readFloatLE(pos); pos += 4;
-      const adc_res = payload.readUInt16LE(pos); pos += 2;
-      const dac_res = payload.readUInt16LE(pos); pos += 2;
-      const last_target_voltage = payload.readFloatLE(pos); pos += 4;
-      const success_rate_percent = payload.readUInt16LE(pos) / 100.0; pos += 2;
-      ioRef.emit('feedback-info', {
-        feedback_enabled: !!feedback_enabled,
-        feedback_tolerance,
-        correction_factor,
-        max_iterations,
-        settle_delay,
-        total_corrections,
-        successful_corrections,
-        failed_corrections,
-        total_iterations,
-        avg_error_before,
-        avg_error_after,
-        adc_vref,
-        adc_res,
-        dac_res,
-        last_target_voltage,
-        success_rate_percent,
-        raw: payload.toString('hex'),
-        timestamp: new Date().toISOString(),
-        source,
-      });
+      try {
+        let pos = 0;
+        const feedback_enabled = payload.readUInt8(pos); pos += 1;
+        const feedback_tolerance = payload.readFloatLE(pos); pos += 4;
+        const correction_factor = payload.readUInt8(pos) / 100.0; pos += 1;
+        const max_iterations = payload.readUInt8(pos); pos += 1;
+        const settle_delay = payload.readUInt16LE(pos); pos += 2;
+        const total_corrections = payload.readUInt32LE(pos); pos += 4;
+        const successful_corrections = payload.readUInt32LE(pos); pos += 4;
+        const failed_corrections = payload.readUInt32LE(pos); pos += 4;
+        const total_iterations = payload.readUInt32LE(pos); pos += 4;
+        const avg_error_before = payload.readFloatLE(pos); pos += 4;
+        const avg_error_after = payload.readFloatLE(pos); pos += 4;
+        const adc_vref = payload.readFloatLE(pos); pos += 4;
+        const adc_res = payload.readUInt16LE(pos); pos += 2;
+        const dac_res = payload.readUInt16LE(pos); pos += 2;
+        const last_target_voltage = payload.readFloatLE(pos); pos += 4;
+        const success_rate_percent = payload.readUInt16LE(pos) / 100.0; pos += 2;
+        const parsed = {
+          feedback_enabled: !!feedback_enabled,
+          feedback_tolerance,
+          correction_factor,
+          max_iterations,
+          settle_delay,
+          total_corrections,
+          successful_corrections,
+          failed_corrections,
+          total_iterations,
+          avg_error_before,
+          avg_error_after,
+          adc_vref,
+          adc_res,
+          dac_res,
+          last_target_voltage,
+          success_rate_percent,
+          raw: payload.toString('hex'),
+          timestamp: new Date().toISOString(),
+          source,
+        };
+        console.log('[FeedbackInfo] Parsed:', parsed);
+        ioRef.emit('feedback-info', parsed);
+      } catch (err) {
+        console.error('[FeedbackInfo] Error parsing feedback-info payload:', err, 'Payload:', payload.toString('hex'));
+        ioRef.emit('feedback-info', {
+          error: 'Malformed feedback-info payload',
+          raw: payload.toString('hex'),
+          timestamp: new Date().toISOString(),
+          source,
+        });
+      }
       break;
     }
     case CMD_ADC_DATA:
@@ -571,6 +627,7 @@ module.exports = {
   setTransportMode,
   getTransportMode,
   getDeviceSettingsFromSTM32,
+  getFeedbackInfoFromSTM32,
   CMD_GET_DEVICE_READY,
   CMD_SEND_SW_PARAMETERS,
   CMD_SET_DEVICE_SETTINGS,

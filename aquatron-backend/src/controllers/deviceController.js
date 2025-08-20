@@ -22,8 +22,16 @@ const {
 exports.getFeedbackInfo = async (req, res, next) => {
   try {
     const preferredTransport = req.query.transport || req.headers['x-transport'] || req.body.transport;
-    // No payload needed for feedback info request
-    const result = await sendCommandToSTM32(CMD_GET_FEEDBACK_INFO, undefined, preferredTransport);
+    // Wait for feedback-info event from STM32
+    const result = await getFeedbackInfoFromSTM32(preferredTransport);
+    // Emit feedback-info event to the requesting user's socket using x-socket-id header
+    const io = req.app && req.app.get('io');
+    const socketId = req.headers['x-socket-id'];
+    if (io && socketId) {
+      io.to(socketId).emit('feedback-info', result);
+    } else if (io) {
+      io.emit('feedback-info', result);
+    }
     res.json(result);
   } catch (err) { next(err); }
 };

@@ -79,6 +79,9 @@ const io = new Server(server, {
   }
 });
 
+// Attach io to app for controller access
+app.set('io', io);
+
 // Pass io to deviceComm setup
 const { setupSerial, setupTCP, setupWS } = require('./src/services/deviceComm');
 setupSerial(io);
@@ -88,12 +91,10 @@ setupWS(io);
 // Socket.io connection logging
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
-  
   // Log all incoming events
   socket.onAny((eventName, ...args) => {
     console.log(`🔌 Socket.IO Event: ${eventName}`, args);
   });
-  
   socket.on('disconnect', () => console.log('🔌 Client disconnected:', socket.id));
 });
 
