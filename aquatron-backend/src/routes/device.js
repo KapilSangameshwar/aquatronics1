@@ -1,4 +1,5 @@
 const express = require('express');
+const router = express.Router();
 const { authenticate, authorize } = require('../middleware/auth');
 const {
   getDeviceStatus,
@@ -9,10 +10,16 @@ const {
   requestDeviceReady,
   sendDebugPacket,
   getTransportMode,
-  setTransportMode
+  setTransportMode,
+  getFeedbackInfo,
+  getADCData,
+  getStatistics
 } = require('../controllers/deviceController');
 const { getTransportStatus } = require('../services/deviceComm');
-const router = express.Router();
+// Feedback/ADC/statistics endpoints
+router.get('/feedback-info', authenticate, authorize(['superadmin', 'admin', 'user']), getFeedbackInfo);
+router.get('/adc-data', authenticate, authorize(['superadmin', 'admin', 'user']), getADCData);
+router.get('/statistics', authenticate, authorize(['superadmin', 'admin', 'user']), getStatistics);
 
 // Get device status (heartbeat/ready)
 router.get('/status', authenticate, authorize(['superadmin', 'admin', 'user']), getDeviceStatus);

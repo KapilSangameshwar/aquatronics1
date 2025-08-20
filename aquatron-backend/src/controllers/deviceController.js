@@ -9,8 +9,42 @@ const {
   CMD_SET_DEVICE_SETTINGS,
   CMD_GET_DEVICE_SETTINGS,
   setTransportMode,
-  getTransportMode
+  getTransportMode,
+  CMD_GET_FEEDBACK_INFO,
+  CMD_FEEDBACK_INFO,
+  CMD_GET_ADC,
+  CMD_ADC_DATA,
+  CMD_GET_STAT,
+  CMD_STAT_DATA
 } = require('../services/deviceComm');
+// --- FEEDBACK/ADC/STATISTICS CONTROLLERS ---
+
+exports.getFeedbackInfo = async (req, res, next) => {
+  try {
+    const preferredTransport = req.query.transport || req.headers['x-transport'] || req.body.transport;
+    // No payload needed for feedback info request
+    const result = await sendCommandToSTM32(CMD_GET_FEEDBACK_INFO, undefined, preferredTransport);
+    res.json(result);
+  } catch (err) { next(err); }
+};
+
+exports.getADCData = async (req, res, next) => {
+  try {
+    const preferredTransport = req.query.transport || req.headers['x-transport'] || req.body.transport;
+    // No payload needed for ADC data request
+    const result = await sendCommandToSTM32(CMD_GET_ADC, undefined, preferredTransport);
+    res.json(result);
+  } catch (err) { next(err); }
+};
+
+exports.getStatistics = async (req, res, next) => {
+  try {
+    const preferredTransport = req.query.transport || req.headers['x-transport'] || req.body.transport;
+    // No payload needed for statistics request
+    const result = await sendCommandToSTM32(CMD_GET_STAT, undefined, preferredTransport);
+    res.json(result);
+  } catch (err) { next(err); }
+};
 
 const TestLog = require('../models/HistoryLog'); // ✅ New import
 const mongoose = require('mongoose');
@@ -206,7 +240,8 @@ exports.sendDeviceCommand = async (req, res, next) => {
 exports.getDeviceSettings = async (req, res, next) => {
   try {
     const preferredTransport = req.query.transport || req.headers['x-transport'];
-    const result = await sendCommandToSTM32(CMD_GET_DEVICE_SETTINGS, undefined, preferredTransport);
+    const { getDeviceSettingsFromSTM32 } = require('../services/deviceComm');
+    const result = await getDeviceSettingsFromSTM32(preferredTransport);
     res.json(result);
   } catch (err) { next(err); }
 };

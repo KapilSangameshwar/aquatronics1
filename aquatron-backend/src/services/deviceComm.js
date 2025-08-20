@@ -1,3 +1,25 @@
+// Wait for CMD_DEVICE_SETTINGS response and return parsed settings
+function getDeviceSettingsFromSTM32(preferredTransport) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Listen for device-settings event ONCE
+      const timeout = setTimeout(() => {
+        if (ioRef) ioRef.off('device-settings', handler);
+        reject(new Error('Timeout waiting for device settings from STM32'));
+      }, 3000);
+      function handler(data) {
+        clearTimeout(timeout);
+        if (ioRef) ioRef.off('device-settings', handler);
+        console.log('[DeviceSettings] device-settings event received:', data);
+        resolve(data); // Return the full structured object
+      }
+      if (ioRef) ioRef.on('device-settings', handler);
+      await sendCommandToSTM32(CMD_GET_DEVICE_SETTINGS, undefined, preferredTransport);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
 // Add heartbeat logs to HistoryLog (TestLog) when device heartbeat is received
 const TestLog = require('../models/HistoryLog');
 const { SerialPort } = require('serialport');
@@ -19,6 +41,13 @@ const CMD_DATA_ACK = 0x05;
 const CMD_SET_DEVICE_SETTINGS = 0x06;
 const CMD_GET_DEVICE_SETTINGS = 0x07;
 const CMD_DEVICE_SETTINGS = 0x08;
+// Feedback/ADC/statistics protocol
+const CMD_GET_FEEDBACK_INFO = 0x09; // Request feedback/ADC/statistics (match STM32)
+const CMD_FEEDBACK_INFO = 0x0A;     // Response with feedback/ADC/statistics (match STM32)
+const CMD_GET_ADC = 0x22;           // Request raw ADC values
+const CMD_ADC_DATA = 0x23;          // Response with ADC data
+const CMD_GET_STAT = 0x24;          // Request statistics
+const CMD_STAT_DATA = 0x25;         // Response with statistics
 
 let serialPort;
 let tcpClient;
@@ -207,7 +236,7 @@ function handlePacket({ cmd, payload, len, source }) {
   // Emit high-level events to frontend
   switch (cmd) {
     case CMD_DEVICE_ONLINE:
-      console.log('Heartbeat received:', payload.toString('hex'));
+      // ...existing code...
       const heartbeatData = {
         online: true, 
         payload: payload.toString('hex'),
@@ -218,7 +247,6 @@ function handlePacket({ cmd, payload, len, source }) {
         message: 'Device heartbeat - ready for commands'
       };
       ioRef.emit('device-status', heartbeatData);
-      // Also emit as device-data for consistency
       ioRef.emit('device-data', { 
         type: 'heartbeat',
         cmd: cmd,
@@ -229,7 +257,7 @@ function handlePacket({ cmd, payload, len, source }) {
       });
       break;
     case CMD_DEVICE_IS_READY:
-      console.log('Device ready signal received:', payload.toString('hex'));
+      // ...existing code...
       const readyData = {
         ready: true, 
         payload: payload.toString('hex'),
@@ -240,7 +268,6 @@ function handlePacket({ cmd, payload, len, source }) {
         message: 'Device ready for next command'
       };
       ioRef.emit('device-ready', readyData);
-      // Also emit as device-status to update the overall status
       ioRef.emit('device-status', {
         online: true,
         ready: true,
@@ -255,8 +282,103 @@ function handlePacket({ cmd, payload, len, source }) {
     case CMD_DATA_ACK:
       ioRef.emit('device-ack', { ack: true, payload: payload.toString('hex') });
       break;
-    case CMD_DEVICE_SETTINGS:
-      ioRef.emit('device-settings', { settings: payload.toString('hex') });
+    case CMD_DEVICE_SETTINGS: {
+      // Parse device settings payload
+      let pos = 0;
+      const freefall = payload.readInt16LE(pos); pos += 2;
+      const hptf = payload.readInt16LE(pos); pos += 2;
+      const feedback_enabled = payload.readUInt8(pos); pos += 1;
+      const feedback_tolerance = payload.readUInt8(pos) / 1000.0; pos += 1;
+      const harmonic_val = payload.readUInt8(pos); pos += 1;
+      const harmonic = harmonic_val === 1 ? 'HALF' : (harmonic_val === 2 ? 'QUARTER' : 'FULL');
+      const duration_ms = payload.readUInt16LE(pos); pos += 2;
+      const element_count = payload.readUInt8(pos); pos += 1;
+      const elements = [];
+      for (let i = 0; i < element_count && pos + 11 <= payload.length; i++) {
+        const symbol = payload.slice(pos, pos + 3).toString('ascii').replace(/\0+$/, ''); pos += 3;
+        const vout_base = payload.readFloatLE(pos); pos += 4;
+        const freq = payload.readUInt32LE(pos); pos += 4;
+        elements.push({ symbol, vout_base, freq });
+      }
+      ioRef.emit('device-settings', {
+        freefall,
+        hptf,
+        feedback_enabled: !!feedback_enabled,
+        feedback_tolerance,
+        harmonic,
+        duration_ms,
+        element_count,
+        elements,
+        raw: payload.toString('hex'),
+        timestamp: new Date().toISOString(),
+        source,
+      });
+      break;
+    }
+    case CMD_FEEDBACK_INFO: {
+      // Parse feedback info payload as per STM32 structure
+      let pos = 0;
+      const feedback_enabled = payload.readUInt8(pos); pos += 1;
+      const feedback_tolerance = payload.readFloatLE(pos); pos += 4;
+      const correction_factor = payload.readUInt8(pos) / 100.0; pos += 1;
+      const max_iterations = payload.readUInt8(pos); pos += 1;
+      const settle_delay = payload.readUInt16LE(pos); pos += 2;
+      const total_corrections = payload.readUInt32LE(pos); pos += 4;
+      const successful_corrections = payload.readUInt32LE(pos); pos += 4;
+      const failed_corrections = payload.readUInt32LE(pos); pos += 4;
+      const total_iterations = payload.readUInt32LE(pos); pos += 4;
+      const avg_error_before = payload.readFloatLE(pos); pos += 4;
+      const avg_error_after = payload.readFloatLE(pos); pos += 4;
+      const adc_vref = payload.readFloatLE(pos); pos += 4;
+      const adc_res = payload.readUInt16LE(pos); pos += 2;
+      const dac_res = payload.readUInt16LE(pos); pos += 2;
+      const last_target_voltage = payload.readFloatLE(pos); pos += 4;
+      const success_rate_percent = payload.readUInt16LE(pos) / 100.0; pos += 2;
+      ioRef.emit('feedback-info', {
+        feedback_enabled: !!feedback_enabled,
+        feedback_tolerance,
+        correction_factor,
+        max_iterations,
+        settle_delay,
+        total_corrections,
+        successful_corrections,
+        failed_corrections,
+        total_iterations,
+        avg_error_before,
+        avg_error_after,
+        adc_vref,
+        adc_res,
+        dac_res,
+        last_target_voltage,
+        success_rate_percent,
+        raw: payload.toString('hex'),
+        timestamp: new Date().toISOString(),
+        source,
+      });
+      break;
+    }
+    case CMD_ADC_DATA:
+      // Parse payload as array of 16-bit unsigned integers (little-endian)
+      const adcValues = [];
+      for (let i = 0; i + 1 < payload.length; i += 2) {
+        adcValues.push(payload.readUInt16LE(i));
+      }
+      ioRef.emit('adc-data', {
+        cmd,
+        raw: payload.toString('hex'),
+        values: adcValues,
+        timestamp: new Date().toISOString(),
+        source,
+      });
+      break;
+    case CMD_STAT_DATA:
+      ioRef.emit('stat-data', {
+        cmd,
+        raw: payload.toString('hex'),
+        timestamp: new Date().toISOString(),
+        source,
+        // TODO: parse actual statistics from payload
+      });
       break;
     default:
       ioRef.emit('device-data', { 
@@ -448,8 +570,16 @@ module.exports = {
   getTransportStatus,
   setTransportMode,
   getTransportMode,
+  getDeviceSettingsFromSTM32,
   CMD_GET_DEVICE_READY,
   CMD_SEND_SW_PARAMETERS,
   CMD_SET_DEVICE_SETTINGS,
-  CMD_GET_DEVICE_SETTINGS
+  CMD_GET_DEVICE_SETTINGS,
+  // Feedback/ADC/statistics protocol
+  CMD_GET_FEEDBACK_INFO,
+  CMD_FEEDBACK_INFO,
+  CMD_GET_ADC,
+  CMD_ADC_DATA,
+  CMD_GET_STAT,
+  CMD_STAT_DATA
 };
