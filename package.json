@@ -1,6 +1,8 @@
 {
   "dependencies": {
     "bcrypt": "^6.0.0",
-    "pdfkit": "^0.17.1"
+    "leaflet": "^1.9.4",
+    "pdfkit": "^0.17.1",
+    "react-leaflet": "^5.0.0"
   }
 }

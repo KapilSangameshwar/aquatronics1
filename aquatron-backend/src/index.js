@@ -10,7 +10,7 @@ const deviceRoutes = require('./routes/device');
 const commandRoutes = require('./routes/command');
 const testLogRoutes = require('./routes/testLogRoutes');
 const historyRoutes = require('./routes/historyroutes');
-const { setupSerial, setupTCP, setupWS } = require('./services/deviceComm');
+const { setupSerial, setupWS } = require('./services/deviceComm');
 const { errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
@@ -48,8 +48,19 @@ mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopol
   .catch(err => console.error('MongoDB connection error:', err));
 
 // Device communication setup
-setupSerial(io);
-setupTCP(io);
+const serialPortPath = process.env.SERIAL_PORT;
+let serialBaud = process.env.SERIAL_BAUD;
+if (serialBaud) {
+  serialBaud = parseInt(String(serialBaud).replace(/\D/g, ''), 10) || 115200;
+} else {
+  serialBaud = 115200;
+}
+if (serialPortPath) {
+  setupSerial(io, serialPortPath, serialBaud);
+} else {
+  console.warn('SERIAL_PORT not defined in .env, skipping serial setup');
+}
+
 setupWS(io);
 
 // Socket.io connection

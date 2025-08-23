@@ -1,0 +1,2322 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Chemical Analyzer System - Restructured (Fixed)
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <ctype.h>
+
+/* Private defines -----------------------------------------------------------*/
+#define UART_RINGBUF_SIZE           256
+#define ELEMENT_MIN_CAPACITY    	5
+#define ELEMENT_MAX_CAPACITY   	   64
+#define HPTF_OPTION_COUNT          3
+#define HARMONIC_OPTION_COUNT      3
+#define DEVICE_HEARTBEAT_INTERVAL_MS 600
+#define PKT_HEADER                 0xAA
+#define PKT_END                    0x55
+#define PKT_MAX_PAYLOAD            64
+#define PKT_MAX_PACKET_SIZE        (5 + PKT_MAX_PAYLOAD)
+#define STATUS_READY               0x01
+#define ELEMENT_DB_SIZE            (sizeof(element_db) / sizeof(ElementProfile))
+#define MAX_CORRECTION_HISTORY 		10
+
+/* Error codes */
+#define ACK_OK                    0x00
+#define ERR_INVALID_LEN           0x01
+#define ERR_INVALID_VALUE         0x02
+#define ERR_INVALID_ELEMENT       0x03
+#define ERR_LEN_MISMATCH          0x04
+#define ERR_ZERO_QUANTITY         0x05
+
+/*Feedback codes*/
+#define FEEDBACK_ENABLED               1
+#define FEEDBACK_MAX_ITERATIONS        5
+#define FEEDBACK_TOLERANCE             0.001f    // 3 decimal places (0.001V)
+#define FEEDBACK_CORRECTION_FACTOR     0.8f      // Damping factor for corrections
+#define ADC_VREF                       3.3f      // ADC reference voltage
+#define ADC_RESOLUTION                 65536     // 16-bit ADC (2^16)
+#define DAC_RESOLUTION                 4096      // 12-bit DAC (2^12)
+#define FEEDBACK_SETTLE_DELAY_MS       10        // Time to wait after DAC change
+
+/* Private typedefs ----------------------------------------------------------*/
+typedef enum {
+    WAIT_HEADER,
+    WAIT_CMD,
+    WAIT_LEN,
+    WAIT_PAYLOAD,
+    WAIT_CHK,
+    WAIT_END
+} packet_state_t;
+
+typedef enum {
+    CMD_DEVICE_ONLINE        = 0x01,
+    CMD_GET_DEVICE_READY     = 0x02,
+    CMD_DEVICE_IS_READY      = 0x03,
+    CMD_SEND_SW_PARAMETERS   = 0x04,
+    CMD_DATA_ACK             = 0x05,
+    CMD_SET_DEVICE_SETTINGS  = 0x06,
+    CMD_GET_DEVICE_SETTINGS  = 0x07,
+    CMD_DEVICE_SETTINGS      = 0x08,
+	CMD_GET_FEEDBACK_INFO    = 0x09,
+	CMD_FEEDBACK_INFO        = 0x0A,
+	CMD_GET_DETAILED_FEEDBACK = 0x0B,
+	CMD_DETAILED_FEEDBACK     = 0x0C,
+} CmdCode_t;
+
+typedef enum {
+    INTERFACE_UART2 = 0,
+    INTERFACE_UART10 = 1,
+    INTERFACE_BOTH = 2
+} comm_interface_t;
+
+typedef struct {
+    char symbol[3];
+    float vout_base;
+    uint32_t freq;
+} ElementProfile;
+
+typedef struct {
+    char symbol[3];
+    uint16_t quantity;
+} Element;
+
+typedef struct {
+    int free_fall;
+    int hptf;
+    char harmonic[10];
+    Element *elements;
+    uint8_t element_count;
+    uint8_t element_capacity;
+} TestInput;
+
+typedef struct {
+    float *vout;
+    uint32_t *freq;
+    char **duration;  // Fixed: Should be char** not char*
+    char **element_symbols;
+    uint8_t count;
+    uint8_t capacity;
+} OutputResult;
+
+typedef struct {
+    uint8_t header;
+    uint8_t cmd;
+    uint8_t len;
+    uint8_t payload[PKT_MAX_PAYLOAD];
+    uint8_t checksum;
+    uint8_t end;
+} UartPacket;
+
+typedef struct {
+    uint8_t buffer[UART_RINGBUF_SIZE];
+    volatile uint16_t head;
+    volatile uint16_t tail;
+} RingBuffer;
+
+typedef struct {
+    uint8_t rx_buf[PKT_MAX_PACKET_SIZE];
+    uint16_t rx_pos;
+    packet_state_t state;
+    uint8_t rx_cmd;
+    uint8_t rx_len;
+} PacketParser;
+
+typedef struct {
+    float target_voltage;
+    float measured_voltage;
+    uint32_t dac_value;
+    uint32_t corrected_dac_value;
+    uint8_t iterations;
+    bool converged;
+    float correction_steps[FEEDBACK_MAX_ITERATIONS];  // Store each correction step
+    float measured_steps[FEEDBACK_MAX_ITERATIONS];    // Store measured voltage at each step
+    uint32_t dac_steps[FEEDBACK_MAX_ITERATIONS];      // Store DAC values at each step
+    char element_symbol[3];                           // Which element this correction was for
+    uint32_t timestamp;
+} FeedbackResult;
+
+static struct {
+    FeedbackResult history[MAX_CORRECTION_HISTORY];
+    uint8_t history_count;
+    uint8_t history_index;  // Circular buffer index
+} correction_tracker = {0};
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
+DAC_HandleTypeDef hdac1;
+
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart10;
+
+/* Communication buffers */
+static RingBuffer uart2_ringbuf = {0};
+static RingBuffer uart10_ringbuf = {0};
+static PacketParser uart2_parser = {0};
+static PacketParser uart10_parser = {0};
+
+/* Global variable for tracking last target voltage */
+static float last_target_voltage_global = 0.0f;
+
+/* System configuration */
+static struct {
+    int freefall;
+    int hptf;
+    char harmonic[10];
+    uint16_t duration_ms;
+    bool shuffle_enabled;
+    bool heartbeat_enabled;
+    bool feedback_enabled;
+    float feedback_tolerance;
+} config = {
+    .freefall = 10,
+    .hptf = 500,
+    .harmonic = "FULL",
+    .duration_ms = 7000,
+    .shuffle_enabled = false,
+    .heartbeat_enabled = true,
+    .feedback_enabled = true,
+    .feedback_tolerance = FEEDBACK_TOLERANCE
+};
+
+/* Element database management */
+static struct {
+    ElementProfile *table;
+    uint8_t count;
+    uint8_t capacity;
+} element_db_mgr = {0};
+
+/* System state */
+static struct {
+    uint32_t last_heartbeat_tick;
+    volatile bool stop_current_test;
+    uint8_t *dac_sequence;
+    uint8_t dac_sequence_capacity;
+    // Feedback statistics
+    struct {
+        uint32_t total_corrections;
+        uint32_t successful_corrections;
+        uint32_t failed_corrections;
+        float avg_error_before_correction;
+        float avg_error_after_correction;
+        uint32_t total_iterations;
+    } feedback_stats;
+} system_state = {0};
+
+/* Constant element database */
+static const ElementProfile element_db[] = {
+    {"Li", 3.71, 2226},   {"Ca", 2.95, 1765},   {"Na", 3.032, 1818},
+    {"Cl", 3.916, 2351},  {"Fe", 4.558, 2739},  {"Zn", 4.167, 2504},
+    {"Cu", 4.557, 2739},  {"Pb", 3.321, 1988},  {"Mg", 3.63, 2175},
+    {"Mn", 4.497, 2697},  {"Cd", 3.711, 2228},  {"K", 2.454, 1466},
+    {"B", 5.256, 3161},   {"F", 3.896, 2340},   {"Mo", 4.147, 2486},
+    {"Ni", 4.661, 2797},  {"Se", 3.423, 2052},  {"Si", 3.814, 2287},
+    {"Ag", 4.043, 2428},  {"As", 3.711, 2228},  {"Hg", 3.568, 2140},
+    {"P", 3.402, 2041},   {"Al", 4.065, 2439},  {"Cr", 1.343, 797},
+    {"Co", 4.66, 2797},   {"Ba", 2.598, 1554},  {"Am", 3.341, 1999},
+    {"NO", 4.660, 2797}
+};
+
+/* Function prototypes -------------------------------------------------------*/
+// System initialization
+void SystemClock_Config(void);
+static void MPU_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DAC1_Init(void);
+static void MX_ADC1_Init(void);  // Fixed: Added proper declaration
+static void MX_USART2_UART_Init(void);
+static void MX_USART10_UART_Init(void);
+static bool init_system(void);
+
+// Ring buffer operations
+static int ringbuf_get(RingBuffer *rb);
+static void ringbuf_advance_head(RingBuffer *rb);
+
+// Packet handling
+static int parse_packet_generic(RingBuffer *rb, PacketParser *parser, UartPacket *pkt_out);
+static bool validate_packet(PacketParser *parser);
+static void copy_packet_data(PacketParser *parser, UartPacket *pkt_out);
+static void reset_parser(PacketParser *parser);
+static void send_packet_to_interface(uint8_t cmd, uint8_t *payload, uint8_t len, comm_interface_t interface);
+static void send_packet(uint8_t cmd, uint8_t *payload, uint8_t len);
+
+// Communication
+static void uart_send_to_interface(const char *msg, comm_interface_t interface);
+static void uart_send(const char *msg);
+
+// Main loop
+static void main_loop_content(void);
+
+// Command processing
+static void handle_command_with_interface(UartPacket *pkt, comm_interface_t source_interface);
+static void handle_get_device_ready(comm_interface_t source_interface);
+static void handle_send_sw_parameters(UartPacket *pkt, comm_interface_t source_interface);
+static void handle_set_device_settings(UartPacket *pkt, comm_interface_t source_interface);
+static void handle_get_device_settings(comm_interface_t source_interface);
+static void handle_get_feedback_info(comm_interface_t source_interface);
+static void handle_get_detailed_feedback(comm_interface_t source_interface);
+static void send_data_ack_to_interface(uint8_t status_code, const char *msg, comm_interface_t interface);
+static void send_heartbeat_packet(void);
+
+// Element database management
+static bool init_element_database(void);
+static bool ensure_element_db_capacity(uint8_t new_size);
+static const ElementProfile* find_element(const char *symbol);
+static bool update_or_add_element(const char *symbol, float vout_base, uint32_t freq);
+
+// Test processing
+static bool generate_output(TestInput *input, OutputResult *output);
+static void apply_output(OutputResult *output);
+static float get_harmonic_multiplier(const char *harmonic);
+static void shuffle_sequence(uint8_t count);
+
+// Utility functions
+static const char* harmonic_enum_to_str(uint8_t val);
+static void check_for_ready_command_stop(void);
+
+// Function prototypes to add
+static bool allocate_test_input(TestInput *input, uint8_t element_count);
+static void free_test_input(TestInput *input);
+static bool allocate_output_result(OutputResult *output, uint8_t element_count);
+static void free_output_result(OutputResult *output);
+static bool ensure_dac_sequence_capacity(uint8_t required_size);
+
+// Feedback functions
+static float read_adc_voltage(void);
+static bool calibrate_adc_if_needed(void);
+static uint32_t voltage_to_dac_value(float voltage);
+static float dac_value_to_voltage(uint32_t dac_value);
+static bool perform_voltage_feedback_correction(float target_voltage, FeedbackResult *result, const char *element_symbol);
+static void store_correction_in_history(FeedbackResult *result);
+
+// Debug printing functions
+static void print_device_settings_debug(uint8_t *payload, uint8_t len, comm_interface_t interface);
+static void print_feedback_info_debug(uint8_t *payload, uint8_t len, comm_interface_t interface);
+static void print_hex_payload(uint8_t *payload, uint8_t len, comm_interface_t interface);
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MPU Configuration--------------------------------------------------------*/
+  MPU_Config();
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+    /* Initialize all configured peripherals */
+    MX_GPIO_Init();
+    MX_DAC1_Init();
+    MX_USART2_UART_Init();
+    MX_USART10_UART_Init();
+	MX_ADC1_Init();
+
+    /* Initialize system */
+    if (!init_system()) {
+        //uart_send("ERROR: System initialization failed!\r\n");
+        Error_Handler();
+    }
+
+    //uart_send("Chemical Analyzer System Ready\r\n");
+    //uart_send("Interfaces: UART2 (Wired) + UART10 (WiFi Bridge)\r\n");
+
+    /* Main loop */
+    while (1) {
+        main_loop_content();
+        HAL_Delay(10);
+    }
+}
+
+/* System Initialization Functions ------------------------------------------*/
+
+static bool init_system(void)
+{
+    // Initialize ring buffers and start UART interrupts
+    HAL_UART_Receive_IT(&huart2, &uart2_ringbuf.buffer[uart2_ringbuf.head], 1);
+    HAL_UART_Receive_IT(&huart10, &uart10_ringbuf.buffer[uart10_ringbuf.head], 1);
+
+    // Initialize element database
+    if (!init_element_database()) {
+        return false;
+    }
+
+    // Initialize DAC sequence
+    if (!ensure_dac_sequence_capacity(ELEMENT_MIN_CAPACITY)) {
+        uart_send("ERROR: Failed to allocate DAC sequence memory!\r\n");
+        return false;
+    }
+
+    srand(HAL_GetTick());
+    return true;
+}
+
+static bool init_element_database(void)
+{
+    element_db_mgr.capacity = ELEMENT_DB_SIZE;
+    element_db_mgr.table = malloc(sizeof(ElementProfile) * element_db_mgr.capacity);
+
+    if (element_db_mgr.table == NULL) {
+        return false;
+    }
+
+    memcpy(element_db_mgr.table, element_db, sizeof(ElementProfile) * ELEMENT_DB_SIZE);
+    element_db_mgr.count = ELEMENT_DB_SIZE;
+
+    return true;
+}
+
+/* Ring Buffer Functions ----------------------------------------------------*/
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        ringbuf_advance_head(&uart2_ringbuf);
+        HAL_UART_Receive_IT(&huart2, &uart2_ringbuf.buffer[uart2_ringbuf.head], 1);
+    }
+    else if (huart->Instance == USART10) {
+        ringbuf_advance_head(&uart10_ringbuf);
+        HAL_UART_Receive_IT(&huart10, &uart10_ringbuf.buffer[uart10_ringbuf.head], 1);
+    }
+}
+
+static void ringbuf_advance_head(RingBuffer *rb)
+{
+    rb->head = (rb->head + 1) % UART_RINGBUF_SIZE;
+}
+
+static int ringbuf_get(RingBuffer *rb)
+{
+    if (rb->head == rb->tail) {
+        return -1; // empty
+    }
+
+    uint8_t val = rb->buffer[rb->tail];
+    rb->tail = (rb->tail + 1) % UART_RINGBUF_SIZE;
+    return val;
+}
+
+/* Packet Handling Functions -----------------------------------------------*/
+
+static int parse_packet_generic(RingBuffer *rb, PacketParser *parser, UartPacket *pkt_out)
+{
+    int byte;
+    while ((byte = ringbuf_get(rb)) != -1) {
+        uint8_t b = (uint8_t)byte;
+        switch (parser->state) {
+            case WAIT_HEADER:
+                if (b == PKT_HEADER) {
+                    parser->rx_buf[0] = b;
+                    parser->rx_pos = 1;
+                    parser->state = WAIT_CMD;
+                }
+                break;
+
+            case WAIT_CMD:
+                parser->rx_buf[parser->rx_pos++] = b;
+                parser->rx_cmd = b;
+                parser->state = WAIT_LEN;
+                break;
+
+            case WAIT_LEN:
+                parser->rx_buf[parser->rx_pos++] = b;
+                parser->rx_len = b;
+                parser->state = (parser->rx_len == 0) ? WAIT_CHK : WAIT_PAYLOAD;
+                break;
+
+            case WAIT_PAYLOAD:
+                parser->rx_buf[parser->rx_pos++] = b;
+                if (parser->rx_pos == 3 + parser->rx_len) {
+                    parser->state = WAIT_CHK;
+                }
+                break;
+
+            case WAIT_CHK:
+                parser->rx_buf[parser->rx_pos++] = b;
+                parser->state = WAIT_END;
+                break;
+
+            case WAIT_END:
+                parser->rx_buf[parser->rx_pos++] = b;
+                if (b == PKT_END && validate_packet(parser)) {
+                    copy_packet_data(parser, pkt_out);
+                    reset_parser(parser);
+                    return 1;
+                }
+                reset_parser(parser);
+                break;
+        }
+    }
+    return 0;
+}
+
+static bool validate_packet(PacketParser *parser)
+{
+    uint8_t chk = 0;
+    for (uint16_t i = 0; i < 3 + parser->rx_len; ++i) {
+        chk ^= parser->rx_buf[i];
+    }
+    return (chk == parser->rx_buf[3 + parser->rx_len] &&
+            parser->rx_buf[0] == PKT_HEADER);
+}
+
+static void copy_packet_data(PacketParser *parser, UartPacket *pkt_out)
+{
+    pkt_out->header = parser->rx_buf[0];
+    pkt_out->cmd = parser->rx_buf[1];
+    pkt_out->len = parser->rx_buf[2];
+    if (pkt_out->len > 0) {
+        memcpy(pkt_out->payload, &parser->rx_buf[3], pkt_out->len);
+    }
+    pkt_out->checksum = parser->rx_buf[3 + parser->rx_len];
+    pkt_out->end = parser->rx_buf[4 + parser->rx_len];
+}
+
+static void reset_parser(PacketParser *parser)
+{
+    parser->state = WAIT_HEADER;
+    parser->rx_pos = 0;
+}
+
+/* Communication Functions -------------------------------------------------*/
+
+static void send_packet_to_interface(uint8_t cmd, uint8_t *payload, uint8_t len, comm_interface_t interface)
+{
+    uint8_t buf[PKT_MAX_PACKET_SIZE];
+
+    // Build packet
+    buf[0] = PKT_HEADER;
+    buf[1] = cmd;
+    buf[2] = len;
+    if (len > 0 && payload) {
+        memcpy(&buf[3], payload, len);
+    }
+
+    // Calculate checksum
+    uint8_t chk = 0;
+    for (uint8_t i = 0; i < 3 + len; ++i) {
+        chk ^= buf[i];
+    }
+    buf[3 + len] = chk;
+    buf[4 + len] = PKT_END;
+
+    // Send to selected interface(s)
+    switch (interface) {
+        case INTERFACE_UART2:
+            HAL_UART_Transmit(&huart2, buf, 5 + len, HAL_MAX_DELAY);
+            break;
+        case INTERFACE_UART10:
+            HAL_UART_Transmit(&huart10, buf, 5 + len, HAL_MAX_DELAY);
+            break;
+        case INTERFACE_BOTH:
+            HAL_UART_Transmit(&huart2, buf, 5 + len, HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart10, buf, 5 + len, HAL_MAX_DELAY);
+            break;
+    }
+}
+
+static void uart_send_to_interface(const char *msg, comm_interface_t interface)
+{
+    switch (interface) {
+        case INTERFACE_UART2:
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+            break;
+        case INTERFACE_UART10:
+            HAL_UART_Transmit(&huart10, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+            break;
+        case INTERFACE_BOTH:
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart10, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+            break;
+    }
+}
+
+static void uart_send(const char *msg)
+{
+    uart_send_to_interface(msg, INTERFACE_BOTH);
+}
+
+/* Main Loop Function ------------------------------------------------------*/
+
+static void main_loop_content(void)
+{
+    static UartPacket pkt2, pkt10;
+    uint32_t now = HAL_GetTick();
+
+    // Handle heartbeat
+    if (config.heartbeat_enabled &&
+        (now - system_state.last_heartbeat_tick >= DEVICE_HEARTBEAT_INTERVAL_MS)) {
+        send_heartbeat_packet();
+        system_state.last_heartbeat_tick = now;
+    }
+
+    // Process UART2 packets
+    while (parse_packet_generic(&uart2_ringbuf, &uart2_parser, &pkt2)) {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[UART2] Recv PKT: CMD=0x%02X, LEN=%d\r\n",
+                 pkt2.cmd, pkt2.len);
+        uart_send_to_interface(dbg, INTERFACE_UART2);
+        handle_command_with_interface(&pkt2, INTERFACE_UART2);
+    }
+
+    // Process UART10 packets
+    while (parse_packet_generic(&uart10_ringbuf, &uart10_parser, &pkt10)) {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[WiFi] Recv PKT: CMD=0x%02X, LEN=%d\r\n",
+                 pkt10.cmd, pkt10.len);
+        uart_send_to_interface(dbg, INTERFACE_UART10);
+        handle_command_with_interface(&pkt10, INTERFACE_UART10);
+    }
+}
+
+/* Command Processing Functions --------------------------------------------*/
+
+static void handle_command_with_interface(UartPacket *pkt, comm_interface_t source_interface)
+{
+    switch (pkt->cmd) {
+        case CMD_GET_DEVICE_READY:
+            handle_get_device_ready(source_interface);
+            break;
+
+        case CMD_SEND_SW_PARAMETERS:
+            handle_send_sw_parameters(pkt, source_interface);
+            break;
+
+        case CMD_SET_DEVICE_SETTINGS:
+            handle_set_device_settings(pkt, source_interface);
+            break;
+
+        case CMD_GET_DEVICE_SETTINGS:
+            handle_get_device_settings(source_interface);
+            break;
+
+        case CMD_DATA_ACK:
+            // ACK received - typically no action needed
+            break;
+
+        case CMD_GET_FEEDBACK_INFO:
+            handle_get_feedback_info(source_interface);
+            break;
+
+        case CMD_GET_DETAILED_FEEDBACK:  // NEW
+            handle_get_detailed_feedback(source_interface);
+            break;
+
+        default:
+            // Unknown command - could log for debugging
+            break;
+    }
+}
+
+static void handle_get_device_ready(comm_interface_t source_interface)
+{
+    config.heartbeat_enabled = false;
+    uint8_t status_payload[1] = {STATUS_READY};
+    send_packet_to_interface(CMD_DEVICE_IS_READY, status_payload, 1, source_interface);
+}
+
+static void handle_send_sw_parameters(UartPacket *pkt, comm_interface_t source_interface)
+{
+    TestInput input = {0};
+    OutputResult output = {0};
+
+    // Validate packet length
+    if (pkt->len < 1) {
+        send_data_ack_to_interface(ERR_INVALID_LEN, "Invalid packet length", source_interface);
+        return;
+    }
+
+    uint8_t element_count = pkt->payload[0];
+    if (element_count == 0) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Zero element count not allowed", source_interface);
+        return;
+    }
+
+    // Optional: Check against maximum capacity
+    #ifdef ELEMENT_MAX_CAPACITY
+    if (element_count > ELEMENT_MAX_CAPACITY) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Element count exceeds maximum", source_interface);
+        return;
+    }
+    #endif
+
+    if (pkt->len != 1 + element_count * 4) {
+        send_data_ack_to_interface(ERR_LEN_MISMATCH, "Packet length mismatch", source_interface);
+        return;
+    }
+
+    // Allocate memory for the dynamic number of elements
+    if (!allocate_test_input(&input, element_count)) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Failed to allocate input memory", source_interface);
+        return;
+    }
+
+    // Ensure DAC sequence capacity
+    if (!ensure_dac_sequence_capacity(element_count)) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Failed to allocate DAC sequence", source_interface);
+        free_test_input(&input);
+        return;
+    }
+
+    // Parse and validate test input
+    input.free_fall = config.freefall;
+    input.hptf = config.hptf;
+    strncpy(input.harmonic, config.harmonic, sizeof(input.harmonic) - 1);
+    input.element_count = element_count;
+
+    bool parse_error = false;
+    for (uint8_t i = 0; i < element_count; i++) {
+        input.elements[i].symbol[0] = pkt->payload[1 + i*4];
+        input.elements[i].symbol[1] = pkt->payload[2 + i*4];
+        input.elements[i].symbol[2] = '\0';
+        input.elements[i].quantity = pkt->payload[3 + i*4] | (pkt->payload[4 + i*4] << 8);
+
+        if (input.elements[i].quantity == 0) {
+            send_data_ack_to_interface(ERR_ZERO_QUANTITY, "Zero quantity not allowed", source_interface);
+            parse_error = true;
+            break;
+        }
+    }
+
+    if (parse_error) {
+        free_test_input(&input);
+        return;
+    }
+
+    // Generate output
+    if (!generate_output(&input, &output)) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Failed to generate output", source_interface);
+        free_test_input(&input);
+        return;
+    }
+
+    // Send ACK and start test
+    send_data_ack_to_interface(ACK_OK, NULL, source_interface);
+
+    // Run continuous test until stopped
+    system_state.stop_current_test = false;
+    while (!system_state.stop_current_test) {
+        HAL_GPIO_WritePin(GPIOB, LD1_Pin, GPIO_PIN_SET);
+        apply_output(&output);
+        HAL_GPIO_WritePin(GPIOB, LD1_Pin, GPIO_PIN_RESET);
+
+        check_for_ready_command_stop();
+        HAL_Delay(10);
+    }
+
+    HAL_GPIO_WritePin(GPIOB, LD1_Pin, GPIO_PIN_RESET);
+
+    // Clean up memory
+    free_test_input(&input);
+    free_output_result(&output);
+}
+
+/* Element Database Functions ----------------------------------------------*/
+
+static const ElementProfile* find_element(const char *symbol)
+{
+    for (uint8_t i = 0; i < element_db_mgr.count; i++) {
+        if (strcasecmp(element_db_mgr.table[i].symbol, symbol) == 0) {
+            return &element_db_mgr.table[i];
+        }
+    }
+    return NULL;
+}
+
+static bool ensure_element_db_capacity(uint8_t new_size)
+{
+    if (new_size <= element_db_mgr.capacity) {
+        return true;
+    }
+
+    uint8_t new_capacity = element_db_mgr.capacity ? element_db_mgr.capacity : 4;
+    while (new_capacity < new_size) {
+        new_capacity *= 2;
+    }
+
+    ElementProfile* new_table = (ElementProfile*)realloc(element_db_mgr.table,
+                                                        sizeof(ElementProfile) * new_capacity);
+    if (!new_table) {
+        return false;
+    }
+
+    element_db_mgr.table = new_table;
+    element_db_mgr.capacity = new_capacity;
+    return true;
+}
+
+/* Test Processing Functions -----------------------------------------------*/
+
+static bool generate_output(TestInput *input, OutputResult *output)
+{
+    if (!input || !output || !input->elements) return false;
+
+    // Allocate memory for output based on input element count
+    if (!allocate_output_result(output, input->element_count)) {
+        uart_send("ERR: Failed to allocate output memory\r\n");
+        return false;
+    }
+
+    float harmonic_factor = get_harmonic_multiplier(input->harmonic);
+    if (harmonic_factor <= 0) {
+        uart_send("ERR: Invalid harmonic value\r\n");
+        return false;
+    }
+
+    for (uint8_t i = 0; i < input->element_count; i++) {
+        Element *e = &input->elements[i];
+
+        if (e->quantity == 0) {
+            char msg[60];
+            snprintf(msg, sizeof(msg), "ERR: Zero quantity for element %s\r\n", e->symbol);
+            uart_send(msg);
+            return false;
+        }
+
+        const ElementProfile *profile = find_element(e->symbol);
+        if (!profile) {
+            char msg[60];
+            snprintf(msg, sizeof(msg), "ERR: Unknown element: %s\r\n", e->symbol);
+            uart_send(msg);
+            return false;
+        }
+
+        // Calculate output parameters
+        float vout = profile->vout_base * harmonic_factor;
+        float duration = ((float)config.duration_ms / 1000.0f) * ((float)e->quantity / 100.0f);
+
+        // Clamp duration to reasonable range
+        if (duration < 0.1f) duration = 0.1f;
+        if (duration > 3600.0f) duration = 3600.0f;
+
+        // Store results
+        output->vout[i] = vout;
+        output->freq[i] = profile->freq;
+        snprintf(output->duration[i], 10, "%lu",
+                 (uint32_t)(duration * 1000.0f + 0.5f));
+        strncpy(output->element_symbols[i], e->symbol, 3);
+    }
+
+    output->count = input->element_count;
+    return true;
+}
+
+/* Replace the existing apply_output function with this enhanced version */
+static void apply_output(OutputResult *output)
+{
+    if (!output || !output->vout || !output->freq || !output->duration) {
+        uart_send("ERR: Invalid output data\r\n");
+        return;
+    }
+
+    if (config.shuffle_enabled) {
+        shuffle_sequence(output->count);
+    }
+
+    HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);
+
+    // Calibrate ADC if feedback is enabled
+    if (config.feedback_enabled) {
+        calibrate_adc_if_needed();
+        uart_send("FB: Feedback correction enabled\r\n");
+    }
+
+    for (uint8_t idx = 0; idx < output->count; idx++) {
+        uint8_t i = config.shuffle_enabled ? system_state.dac_sequence[idx] : idx;
+
+        // Safety check for array bounds
+        if (i >= output->count) {
+            char msg[60];
+            snprintf(msg, sizeof(msg), "ERR: Index %d out of bounds (%d)\r\n", i, output->count);
+            uart_send(msg);
+            continue;
+        }
+
+        float vout = output->vout[i] / 2.35f; // Apply scaling factor
+
+        // Skip voltages outside DAC range
+        if (vout > 3.3f || vout < 0.0f) {
+            char msg[80];
+            snprintf(msg, sizeof(msg), "DAC OUT%d: Skipped (Voltage out of range %.3f V)\r\n",
+                     i+1, vout);
+            uart_send(msg);
+            continue;
+        }
+
+        char msg[120];
+        uint32_t final_dac_value;
+
+        if (config.feedback_enabled) {
+            FeedbackResult fb_result;
+
+            snprintf(msg, sizeof(msg),
+                     "DAC OUT%d: Target %.3f V, Duration %s ms (with feedback)\r\n",
+                     i+1, vout, output->duration[i]);
+            uart_send(msg);
+
+            // NEW: Pass element symbol (assumes OutputResult has element_symbols[i])
+            const char *element_symbol = NULL;
+            if (output->element_symbols && output->element_symbols[i]) {
+                element_symbol = output->element_symbols[i];
+            }
+
+            if (perform_voltage_feedback_correction(vout, &fb_result, element_symbol)) {
+                final_dac_value = fb_result.corrected_dac_value;
+
+                snprintf(msg, sizeof(msg),
+                         "DAC OUT%d: Corrected - Target=%.3fV, Achieved=%.3fV, DAC=%lu\r\n",
+                         i+1, fb_result.target_voltage, fb_result.measured_voltage,
+                         fb_result.corrected_dac_value);
+                uart_send(msg);
+            } else {
+                // Fallback to uncorrected value if feedback fails
+                final_dac_value = voltage_to_dac_value(vout);
+                uart_send("FB: Using uncorrected value due to feedback failure\r\n");
+            }
+        } else {
+            // Use original method without feedback
+            final_dac_value = voltage_to_dac_value(vout);
+
+            snprintf(msg, sizeof(msg), "DAC OUT%d: %.3f V for %s ms (no feedback)\r\n",
+                     i+1, vout, output->duration[i]);
+            uart_send(msg);
+        }
+
+        // Apply the final DAC value
+        HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, final_dac_value);
+
+        // Hold the output for the specified duration
+        uint32_t duration_ms = atoi(output->duration[i]);
+        uint32_t start_time = HAL_GetTick();
+
+        while ((HAL_GetTick() - start_time) < duration_ms) {
+            // Check for stop command during long durations
+            if (duration_ms > 100) { // Only check for long durations
+                check_for_ready_command_stop();
+                if (system_state.stop_current_test) {
+                    break;
+                }
+            }
+            HAL_Delay(10);
+        }
+
+        // Exit early if test was stopped
+        if (system_state.stop_current_test) {
+            break;
+        }
+    }
+
+    HAL_DAC_Stop(&hdac1, DAC_CHANNEL_1);
+}
+
+/* Utility Functions -------------------------------------------------------*/
+
+static float get_harmonic_multiplier(const char *harmonic)
+{
+    if (strcasecmp(harmonic, "FULL") == 0) return 1.0f;
+    if (strcasecmp(harmonic, "HALF") == 0) return 0.5f;
+    if (strcasecmp(harmonic, "QUARTER") == 0) return 0.25f;
+    return 1.0f; // Default fallback
+}
+
+static void shuffle_sequence(uint8_t count)
+{
+    if (count == 0 || !system_state.dac_sequence) return;
+
+    // Ensure we have enough capacity
+    if (count > system_state.dac_sequence_capacity) {
+        if (!ensure_dac_sequence_capacity(count)) {
+            uart_send("ERR: Failed to expand DAC sequence for shuffling\r\n");
+            return;
+        }
+    }
+
+    for (int i = count - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        uint8_t temp = system_state.dac_sequence[i];
+        system_state.dac_sequence[i] = system_state.dac_sequence[j];
+        system_state.dac_sequence[j] = temp;
+    }
+}
+
+static const char* harmonic_enum_to_str(uint8_t val)
+{
+    switch (val) {
+        case 1: return "HALF";
+        case 2: return "QUARTER";
+        case 0:
+        default: return "FULL";
+    }
+}
+
+static void send_heartbeat_packet(void)
+{
+    uint8_t payload[8];
+    uint32_t mcu_id = ((uint32_t*)0x1FF1E800)[0]; // STM32H7 unique ID
+
+    // Pack MCU ID (4 bytes, little-endian)
+    payload[0] = (mcu_id >> 0) & 0xFF;
+    payload[1] = (mcu_id >> 8) & 0xFF;
+    payload[2] = (mcu_id >> 16) & 0xFF;
+    payload[3] = (mcu_id >> 24) & 0xFF;
+
+    payload[4] = 0x01; // HW version
+    payload[5] = 0x00; // Status (OK)
+    payload[6] = config.feedback_enabled ? 1 : 0; // Feedback enabled flag
+    payload[7] = (uint8_t)((config.feedback_tolerance * 1000.0f) + 0.5f); // Feedback tolerance
+
+    send_packet(CMD_DEVICE_ONLINE, payload, 6);
+}
+
+static void send_data_ack_to_interface(uint8_t status_code, const char *msg, comm_interface_t interface)
+{
+    uint8_t resp[33]; // 1 byte status + max 32 bytes message
+    resp[0] = status_code;
+    uint8_t msg_len = 0;
+
+    if (msg) {
+        msg_len = strlen(msg);
+        if (msg_len > 32) msg_len = 32;
+        memcpy(&resp[1], msg, msg_len);
+    }
+
+    send_packet_to_interface(CMD_DATA_ACK, resp, 1 + msg_len, interface);
+}
+
+static void send_packet(uint8_t cmd, uint8_t *payload, uint8_t len)
+{
+    send_packet_to_interface(cmd, payload, len, INTERFACE_BOTH);
+}
+
+static void check_for_ready_command_stop(void)
+{
+    static UartPacket pkt_temp2, pkt_temp10;
+
+    // Check UART2 for CMD_GET_DEVICE_READY
+    while (parse_packet_generic(&uart2_ringbuf, &uart2_parser, &pkt_temp2)) {
+        if (pkt_temp2.cmd == CMD_GET_DEVICE_READY) {
+            system_state.stop_current_test = true;
+            config.heartbeat_enabled = false;
+
+            uint8_t status_payload[1] = {STATUS_READY};
+            send_packet_to_interface(CMD_DEVICE_IS_READY, status_payload, 1, INTERFACE_UART2);
+            return;
+        }
+    }
+
+    // Check UART10 for CMD_GET_DEVICE_READY
+    while (parse_packet_generic(&uart10_ringbuf, &uart10_parser, &pkt_temp10)) {
+        if (pkt_temp10.cmd == CMD_GET_DEVICE_READY) {
+            system_state.stop_current_test = true;
+            config.heartbeat_enabled = false;
+
+            uint8_t status_payload[1] = {STATUS_READY};
+            send_packet_to_interface(CMD_DEVICE_IS_READY, status_payload, 1, INTERFACE_UART10);
+            return;
+        }
+    }
+}
+
+/* Settings Management Functions -------------------------------------------*/
+
+static void handle_set_device_settings(UartPacket *pkt, comm_interface_t source_interface)
+{
+    // Validate minimum packet length
+    if (pkt->len < 10) {
+        send_data_ack_to_interface(ERR_INVALID_LEN, "Packet too short", source_interface);
+        return;
+    }
+
+    // Parse settings from payload
+    int16_t new_freefall = pkt->payload[0] | (pkt->payload[1] << 8);
+    int16_t new_hptf = pkt->payload[2] | (pkt->payload[3] << 8);
+    uint8_t harmonic_val = pkt->payload[4];
+    uint16_t new_duration_ms = pkt->payload[5] | (pkt->payload[6] << 8);
+    uint8_t new_element_count = pkt->payload[7];
+    uint8_t feedback_enabled = pkt->payload[8];
+    uint8_t feedback_tolerance_scaled = pkt->payload[9]; // Tolerance * 1000 (e.g., 1 = 0.001V)
+
+    // Updated validation - remove fixed limit, add reasonable bounds
+    if (new_freefall < 0 || new_hptf <= 0 || harmonic_val > 2 ||
+        new_duration_ms == 0 || new_element_count == 0 ||
+		feedback_tolerance_scaled == 0 || feedback_tolerance_scaled > 100) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Invalid setting values", source_interface);
+        return;
+    }
+
+    // Optional: Check against maximum capacity if defined
+    #ifdef ELEMENT_MAX_CAPACITY
+    if (new_element_count > ELEMENT_MAX_CAPACITY) {
+        send_data_ack_to_interface(ERR_INVALID_VALUE, "Element count exceeds maximum", source_interface);
+        return;
+    }
+    #endif
+
+    // Validate expected packet length
+    int expected_len = 10 + new_element_count * (3 + 4 + 4); // symbol[3] + float + uint32
+    if (pkt->len != expected_len) {
+        send_data_ack_to_interface(ERR_LEN_MISMATCH, "Element data length mismatch", source_interface);
+        return;
+    }
+
+    // Update configuration
+    config.freefall = new_freefall;
+    config.hptf = new_hptf;
+    strncpy(config.harmonic, harmonic_enum_to_str(harmonic_val), sizeof(config.harmonic) - 1);
+    config.harmonic[sizeof(config.harmonic) - 1] = '\0';
+    config.duration_ms = new_duration_ms;
+    config.feedback_enabled = (feedback_enabled != 0);
+    config.feedback_tolerance = (float)feedback_tolerance_scaled / 1000.0f;
+
+    // Update element database
+    uint8_t *p = &pkt->payload[8];
+    for (uint8_t i = 0; i < new_element_count; i++) {
+        char symbol[4] = {0};
+        memcpy(symbol, p, 3);
+        p += 3;
+
+        float new_vout_base;
+        memcpy(&new_vout_base, p, sizeof(float));
+        p += sizeof(float);
+
+        uint32_t new_freq = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+        p += 4;
+
+        if (!update_or_add_element(symbol, new_vout_base, new_freq)) {
+            send_data_ack_to_interface(ERR_INVALID_VALUE, "Failed to update element DB", source_interface);
+            return;
+        }
+    }
+
+    send_data_ack_to_interface(ACK_OK, "Settings updated", source_interface);
+    config.heartbeat_enabled = true;
+}
+
+static void handle_get_device_settings(comm_interface_t source_interface)
+{
+    uint8_t resp[PKT_MAX_PAYLOAD];
+    int pos = 0;
+
+    uart_send_to_interface("Processing CMD_GET_DEVICE_SETTINGS...\r\n", source_interface);
+
+    // Pack basic settings
+    resp[pos++] = (uint8_t)(config.freefall & 0xFF);
+    resp[pos++] = (uint8_t)((config.freefall >> 8) & 0xFF);
+    resp[pos++] = (uint8_t)(config.hptf & 0xFF);
+    resp[pos++] = (uint8_t)((config.hptf >> 8) & 0xFF);
+    resp[pos++] = config.feedback_enabled ? 1 : 0;
+    resp[pos++] = (uint8_t)((config.feedback_tolerance * 1000.0f) + 0.5f); // Scale and round
+
+    // Pack harmonic enum
+    uint8_t harmonic_val = 0; // FULL
+    if (strcasecmp(config.harmonic, "HALF") == 0) harmonic_val = 1;
+    else if (strcasecmp(config.harmonic, "QUARTER") == 0) harmonic_val = 2;
+    resp[pos++] = harmonic_val;
+
+    // Pack duration
+    resp[pos++] = (uint8_t)(config.duration_ms & 0xFF);
+    resp[pos++] = (uint8_t)((config.duration_ms >> 8) & 0xFF);
+
+    // Pack element count
+    resp[pos++] = element_db_mgr.count;
+
+    // Pack element data (up to available space)
+    for (uint8_t i = 0; i < element_db_mgr.count && pos < (PKT_MAX_PAYLOAD - 11); i++) {
+        // Check if we have enough space for this element
+        if (pos + 11 > PKT_MAX_PAYLOAD) break;
+
+        // Pack symbol (3 bytes)
+        memcpy(&resp[pos], element_db_mgr.table[i].symbol, 3);
+        pos += 3;
+
+        // Pack vout_base (4 bytes)
+        memcpy(&resp[pos], &element_db_mgr.table[i].vout_base, sizeof(float));
+        pos += sizeof(float);
+
+        // Pack freq (4 bytes, little-endian)
+        uint32_t freq = element_db_mgr.table[i].freq;
+        resp[pos++] = (uint8_t)(freq & 0xFF);
+        resp[pos++] = (uint8_t)((freq >> 8) & 0xFF);
+        resp[pos++] = (uint8_t)((freq >> 16) & 0xFF);
+        resp[pos++] = (uint8_t)((freq >> 24) & 0xFF);
+    }
+
+    // Print debug information BEFORE sending
+    print_device_settings_debug(resp, pos, source_interface);
+    print_hex_payload(resp, pos, source_interface);
+
+    // Send the packet
+    send_packet_to_interface(CMD_DEVICE_SETTINGS, resp, pos, source_interface);
+
+    char debug_msg[64];
+    snprintf(debug_msg, sizeof(debug_msg), "CMD_DEVICE_SETTINGS sent (%d bytes)\r\n", pos);
+    uart_send_to_interface(debug_msg, source_interface);
+
+    config.heartbeat_enabled = true;
+}
+
+static void handle_get_feedback_info(comm_interface_t source_interface)
+{
+    uint8_t resp[47]; // Fixed size payload
+    int pos = 0;
+
+    uart_send_to_interface("Processing CMD_GET_FEEDBACK_INFO...\r\n", source_interface);
+
+    // Pack feedback configuration
+    resp[pos++] = config.feedback_enabled ? 1 : 0;
+
+    // Pack feedback tolerance (float)
+    memcpy(&resp[pos], &config.feedback_tolerance, sizeof(float));
+    pos += sizeof(float);
+
+    // Pack correction factor as scaled value (0-100)
+    uint8_t correction_factor_scaled = (uint8_t)(FEEDBACK_CORRECTION_FACTOR * 100.0f + 0.5f);
+    resp[pos++] = correction_factor_scaled;
+
+    // Pack max iterations
+    resp[pos++] = FEEDBACK_MAX_ITERATIONS;
+
+    // Pack settle delay (2 bytes)
+    uint16_t settle_delay = FEEDBACK_SETTLE_DELAY_MS;
+    resp[pos++] = (uint8_t)(settle_delay & 0xFF);
+    resp[pos++] = (uint8_t)((settle_delay >> 8) & 0xFF);
+
+    // Pack statistics (all uint32_t values)
+    memcpy(&resp[pos], &system_state.feedback_stats.total_corrections, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.successful_corrections, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.failed_corrections, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.total_iterations, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    // Pack average errors (float values)
+    memcpy(&resp[pos], &system_state.feedback_stats.avg_error_before_correction, sizeof(float));
+    pos += sizeof(float);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.avg_error_after_correction, sizeof(float));
+    pos += sizeof(float);
+
+    // Pack hardware configuration
+    float adc_vref = ADC_VREF;
+    memcpy(&resp[pos], &adc_vref, sizeof(float));
+    pos += sizeof(float);
+
+    uint32_t adc_res = ADC_RESOLUTION;
+    resp[pos++] = (uint8_t)(adc_res & 0xFF);
+    resp[pos++] = (uint8_t)((adc_res >> 8) & 0xFF);
+
+    uint16_t dac_res = DAC_RESOLUTION;
+    resp[pos++] = (uint8_t)(dac_res & 0xFF);
+    resp[pos++] = (uint8_t)((dac_res >> 8) & 0xFF);
+
+    // Pack last target voltage
+    memcpy(&resp[pos], &last_target_voltage_global, sizeof(float));
+    pos += sizeof(float);
+
+    // Calculate and pack success rate percentage (scaled by 100 for 2 decimal places)
+    uint16_t success_rate_percent = 0;
+    if (system_state.feedback_stats.total_corrections > 0) {
+        success_rate_percent = (uint16_t)(
+            ((float)system_state.feedback_stats.successful_corrections /
+             (float)system_state.feedback_stats.total_corrections) * 10000.0f + 0.5f
+        );
+    }
+    resp[pos++] = (uint8_t)(success_rate_percent & 0xFF);
+    resp[pos++] = (uint8_t)((success_rate_percent >> 8) & 0xFF);
+
+    // Print debug information BEFORE sending
+    print_feedback_info_debug(resp, pos, source_interface);
+    print_hex_payload(resp, pos, source_interface);
+
+    // Send the packet
+    send_packet_to_interface(CMD_FEEDBACK_INFO, resp, pos, source_interface);
+
+    char debug_msg[64];
+    snprintf(debug_msg, sizeof(debug_msg), "CMD_FEEDBACK_INFO sent (%d bytes)\r\n", pos);
+    uart_send_to_interface(debug_msg, source_interface);
+
+    // Re-enable heartbeat
+    config.heartbeat_enabled = true;
+}
+static void handle_get_detailed_feedback(comm_interface_t source_interface)
+{
+    uint8_t resp[PKT_MAX_PAYLOAD];
+    int pos = 0;
+
+    // Pack number of corrections in history
+    resp[pos++] = correction_tracker.history_count;
+
+    // Pack each correction history entry
+    for (uint8_t i = 0; i < correction_tracker.history_count && pos < PKT_MAX_PAYLOAD - 20; i++) {
+        uint8_t idx = (correction_tracker.history_index - correction_tracker.history_count + i + MAX_CORRECTION_HISTORY) % MAX_CORRECTION_HISTORY;
+        FeedbackResult *hist = &correction_tracker.history[idx];
+
+        // Pack element symbol (2 bytes)
+        resp[pos++] = hist->element_symbol[0];
+        resp[pos++] = hist->element_symbol[1];
+
+        // Pack target voltage (4 bytes)
+        memcpy(&resp[pos], &hist->target_voltage, sizeof(float));
+        pos += sizeof(float);
+
+        // Pack final achieved voltage (4 bytes)
+        memcpy(&resp[pos], &hist->measured_voltage, sizeof(float));
+        pos += sizeof(float);
+
+        // Pack number of iterations (1 byte)
+        resp[pos++] = hist->iterations + 1;
+
+        // Pack each iteration's data
+        for (uint8_t j = 0; j <= hist->iterations && j < FEEDBACK_MAX_ITERATIONS; j++) {
+            // Pack DAC value (2 bytes - compressed from uint32_t)
+            uint16_t dac_compressed = (uint16_t)(hist->dac_steps[j] >> 4); // Compress 12-bit DAC to fit
+            resp[pos++] = dac_compressed & 0xFF;
+            resp[pos++] = (dac_compressed >> 8) & 0xFF;
+
+            // Pack measured voltage (2 bytes - scaled to millivolts)
+            uint16_t mv = (uint16_t)(hist->measured_steps[j] * 1000.0f + 0.5f);
+            resp[pos++] = mv & 0xFF;
+            resp[pos++] = (mv >> 8) & 0xFF;
+
+            if (pos >= PKT_MAX_PAYLOAD - 4) break; // Prevent overflow
+        }
+
+        if (pos >= PKT_MAX_PAYLOAD - 20) break; // Leave room for more data
+    }
+
+    send_packet_to_interface(CMD_DETAILED_FEEDBACK, resp, pos, source_interface);
+}
+static bool update_or_add_element(const char *symbol, float vout_base, uint32_t freq)
+{
+    // Search for existing element
+    for (uint8_t i = 0; i < element_db_mgr.count; i++) {
+        if (strcasecmp(element_db_mgr.table[i].symbol, symbol) == 0) {
+            // Update existing element
+            element_db_mgr.table[i].vout_base = vout_base;
+            element_db_mgr.table[i].freq = freq;
+            return true;
+        }
+    }
+
+    // Add new element
+    if (!ensure_element_db_capacity(element_db_mgr.count + 1)) {
+        return false;
+    }
+
+    strncpy(element_db_mgr.table[element_db_mgr.count].symbol, symbol, 3);
+    element_db_mgr.table[element_db_mgr.count].symbol[2] = '\0'; // Ensure null termination
+    element_db_mgr.table[element_db_mgr.count].vout_base = vout_base;
+    element_db_mgr.table[element_db_mgr.count].freq = freq;
+    element_db_mgr.count++;
+
+    return true;
+}
+
+/* Memory management functions for dynamic arrays */
+/* Allocate memory for TestInput elements */
+static bool allocate_test_input(TestInput *input, uint8_t element_count)
+{
+    if (!input || element_count == 0) return false;
+
+    // Free existing memory if any
+    free_test_input(input);
+
+    // Allocate new memory
+    input->elements = (Element*)malloc(sizeof(Element) * element_count);
+    if (!input->elements) {
+        return false;
+    }
+
+    input->element_capacity = element_count;
+    input->element_count = 0; // Will be set when elements are added
+
+    // Initialize elements
+    memset(input->elements, 0, sizeof(Element) * element_count);
+
+    return true;
+}
+
+/* Free TestInput memory */
+static void free_test_input(TestInput *input)
+{
+    if (!input) return;
+
+    if (input->elements) {
+        free(input->elements);
+        input->elements = NULL;
+    }
+    input->element_capacity = 0;
+    input->element_count = 0;
+}
+
+/* Allocate memory for OutputResult */
+static bool allocate_output_result(OutputResult *output, uint8_t element_count)
+{
+    if (!output || element_count == 0) return false;
+
+    // Free existing memory if any
+    free_output_result(output);
+
+    // Allocate arrays
+    output->vout = (float*)malloc(sizeof(float) * element_count);
+    output->freq = (uint32_t*)malloc(sizeof(uint32_t) * element_count);
+    output->duration = (char**)malloc(sizeof(char*) * element_count);
+    output->element_symbols = (char**)malloc(sizeof(char*) * element_count);  // Allocate memory for element_symbols
+
+    if (!output->vout || !output->freq || !output->duration || !output->element_symbols) {
+        free_output_result(output); // Clean up partial allocation
+        return false;
+    }
+
+    // Allocate duration strings
+    for (uint8_t i = 0; i < element_count; i++) {
+        output->duration[i] = (char*)malloc(10); // 10 chars as in original
+        if (!output->duration[i]) {
+            // Clean up partial allocation
+            for (uint8_t j = 0; j < i; j++) {
+                free(output->duration[j]);
+            }
+            free_output_result(output);
+            return false;
+        }
+        memset(output->duration[i], 0, 10);
+    }
+
+    // Allocate element symbol strings
+    for (uint8_t i = 0; i < element_count; i++) {
+        output->element_symbols[i] = (char*)malloc(3); // 3 chars for symbol
+        if (!output->element_symbols[i]) {
+            // Clean up partial allocation
+            for (uint8_t j = 0; j < i; j++) {
+                free(output->element_symbols[j]);
+            }
+            free_output_result(output);
+            return false;
+        }
+        memset(output->element_symbols[i], 0, 3);
+    }
+
+    output->capacity = element_count;
+    output->count = 0;
+
+    // Initialize arrays
+    memset(output->vout, 0, sizeof(float) * element_count);
+    memset(output->freq, 0, sizeof(uint32_t) * element_count);
+
+    return true;
+}
+
+
+/* Free OutputResult memory */
+static void free_output_result(OutputResult *output)
+{
+    if (!output) return;
+
+    if (output->duration) {
+        for (uint8_t i = 0; i < output->capacity; i++) {
+            if (output->duration[i]) {
+                free(output->duration[i]);
+            }
+        }
+        free(output->duration);
+        output->duration = NULL;
+    }
+
+    if (output->element_symbols) {
+        for (uint8_t i = 0; i < output->capacity; i++) {
+            if (output->element_symbols[i]) {
+                free(output->element_symbols[i]);
+            }
+        }
+        free(output->element_symbols);
+        output->element_symbols = NULL;
+    }
+
+    if (output->vout) {
+        free(output->vout);
+        output->vout = NULL;
+    }
+
+    if (output->freq) {
+        free(output->freq);
+        output->freq = NULL;
+    }
+
+    output->capacity = 0;
+    output->count = 0;
+}
+
+
+/* Ensure DAC sequence has enough capacity */
+static bool ensure_dac_sequence_capacity(uint8_t required_size)
+{
+    if (system_state.dac_sequence_capacity >= required_size) {
+        return true; // Already have enough capacity
+    }
+
+    // Reallocate with new size
+    uint8_t *new_sequence = (uint8_t*)realloc(system_state.dac_sequence,
+                                              sizeof(uint8_t) * required_size);
+    if (!new_sequence) {
+        return false;
+    }
+
+    // Initialize new elements
+    for (uint8_t i = system_state.dac_sequence_capacity; i < required_size; i++) {
+        new_sequence[i] = i;
+    }
+
+    system_state.dac_sequence = new_sequence;
+    system_state.dac_sequence_capacity = required_size;
+
+    return true;
+}
+
+/* ADC reading and conversion functions ---------------------------------------------*/
+static float read_adc_voltage(void)
+{
+    uint32_t adc_value = 0;
+    const uint8_t num_samples = 4; // Average multiple readings for better accuracy
+
+    // Take multiple samples and average them
+    for (uint8_t i = 0; i < num_samples; i++) {
+        HAL_ADC_Start(&hadc1);
+        if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
+            adc_value += HAL_ADC_GetValue(&hadc1);
+        }
+        HAL_ADC_Stop(&hadc1);
+        HAL_Delay(1); // Small delay between samples
+    }
+
+    adc_value /= num_samples; // Average the samples
+
+    // Convert ADC value to voltage
+    float voltage = ((float)adc_value / (float)ADC_RESOLUTION) * ADC_VREF;
+
+    return voltage;
+}
+
+static bool calibrate_adc_if_needed(void)
+{
+    // Perform ADC calibration if needed
+    if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET_LINEARITY, ADC_SINGLE_ENDED) != HAL_OK) {
+        uart_send("WARN: ADC calibration failed\r\n");
+        return false;
+    }
+    return true;
+}
+
+static uint32_t voltage_to_dac_value(float voltage)
+{
+    // Convert voltage to DAC value
+    uint32_t dac_val = (uint32_t)((voltage / 3.3f) * (DAC_RESOLUTION - 1) + 0.5f);
+    if (dac_val >= DAC_RESOLUTION) dac_val = DAC_RESOLUTION - 1;
+    return dac_val;
+}
+
+static float dac_value_to_voltage(uint32_t dac_value)
+{
+    // Convert DAC value back to voltage
+    return ((float)dac_value / (float)(DAC_RESOLUTION - 1)) * 3.3f;
+}
+
+/* Feedback correction algorithm -------------------------------------------------------*/
+static bool perform_voltage_feedback_correction(float target_voltage,FeedbackResult *result,const char* element_symbol)
+{
+    last_target_voltage_global = target_voltage;
+
+    if (!result || target_voltage < 0.0f || target_voltage > 3.3f) {
+        return false;
+    }
+
+    // Initialize result structure
+    memset(result, 0, sizeof(FeedbackResult));
+    result->target_voltage = target_voltage;
+    result->dac_value = voltage_to_dac_value(target_voltage);
+    result->corrected_dac_value = result->dac_value;
+
+    // NEW: Store element info
+    if (element_symbol) {
+        strncpy(result->element_symbol, element_symbol, 2);
+        result->element_symbol[2] = '\0';
+    }
+    result->timestamp = HAL_GetTick();
+
+    char debug_msg[100];
+    snprintf(debug_msg, sizeof(debug_msg),
+             "FB: Target=%.3fV, Initial DAC=%lu\r\n",
+             target_voltage, result->dac_value);
+    uart_send(debug_msg);
+
+    // Take initial error reading for statistics
+    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, result->dac_value);
+    HAL_Delay(FEEDBACK_SETTLE_DELAY_MS);
+    float initial_measured_voltage = read_adc_voltage();
+    float initial_error = target_voltage - initial_measured_voltage;
+
+    // Iterative feedback correction
+    for (result->iterations = 0; result->iterations < FEEDBACK_MAX_ITERATIONS; result->iterations++) {
+        // Set DAC output
+        HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, result->corrected_dac_value);
+        HAL_Delay(FEEDBACK_SETTLE_DELAY_MS);
+
+        // Read actual voltage from ADC
+        result->measured_voltage = read_adc_voltage();
+
+        // NEW: Store step data
+        result->measured_steps[result->iterations]   = result->measured_voltage;
+        result->dac_steps[result->iterations]        = result->corrected_dac_value;
+
+        // Calculate error
+        float error = target_voltage - result->measured_voltage;
+        result->correction_steps[result->iterations] = error;   // Store correction
+        float abs_error = (error < 0) ? -error : error;
+
+        snprintf(debug_msg, sizeof(debug_msg),
+                 "FB Iter%d: Measured=%.3fV, Error=%.3fV, DAC=%lu\r\n",
+                 result->iterations + 1, result->measured_voltage, error, result->corrected_dac_value);
+        uart_send(debug_msg);
+
+        // Check if we've reached the desired tolerance
+        if (abs_error <= config.feedback_tolerance) {
+            result->converged = true;
+            snprintf(debug_msg, sizeof(debug_msg),
+                     "FB: Converged in %d iterations (Error=%.4fV)\r\n",
+                     result->iterations + 1, abs_error);
+            uart_send(debug_msg);
+            break;
+        }
+
+        // Calculate correction (proportional + damping)
+        float voltage_correction = error * FEEDBACK_CORRECTION_FACTOR;
+        float new_target_voltage = dac_value_to_voltage(result->corrected_dac_value) + voltage_correction;
+
+        // Clamp to valid range
+        if (new_target_voltage < 0.0f) new_target_voltage = 0.0f;
+        if (new_target_voltage > 3.3f) new_target_voltage = 3.3f;
+
+        // Convert back to DAC value
+        uint32_t new_dac_value = voltage_to_dac_value(new_target_voltage);
+
+        // Prevent oscillation by limiting large changes
+        int32_t dac_change = (int32_t)new_dac_value - (int32_t)result->corrected_dac_value;
+        int32_t max_change = DAC_RESOLUTION / 20; // Limit to 5% change per iteration
+
+        if (dac_change > max_change) dac_change = max_change;
+        else if (dac_change < -max_change) dac_change = -max_change;
+
+        result->corrected_dac_value += dac_change;
+
+        // Ensure DAC value is within range
+        if (result->corrected_dac_value >= DAC_RESOLUTION) {
+            result->corrected_dac_value = DAC_RESOLUTION - 1;
+        }
+    }
+
+    if (!result->converged) {
+        snprintf(debug_msg, sizeof(debug_msg),
+                 "FB: Failed to converge after %d iterations (Error=%.4fV)\r\n",
+                 FEEDBACK_MAX_ITERATIONS, target_voltage - result->measured_voltage);
+        uart_send(debug_msg);
+    }
+
+    // Update statistics
+    system_state.feedback_stats.total_corrections++;
+    system_state.feedback_stats.total_iterations += (result->iterations + 1);
+
+    float final_error = target_voltage - result->measured_voltage;
+
+    system_state.feedback_stats.avg_error_before_correction =
+        (system_state.feedback_stats.avg_error_before_correction *
+         (system_state.feedback_stats.total_corrections - 1) +
+         (initial_error < 0 ? -initial_error : initial_error)) /
+        system_state.feedback_stats.total_corrections;
+
+    system_state.feedback_stats.avg_error_after_correction =
+        (system_state.feedback_stats.avg_error_after_correction *
+         (system_state.feedback_stats.total_corrections - 1) +
+         (final_error < 0 ? -final_error : final_error)) /
+        system_state.feedback_stats.total_corrections;
+
+    if (result->converged) {
+        system_state.feedback_stats.successful_corrections++;
+    } else {
+        system_state.feedback_stats.failed_corrections++;
+    }
+
+    // NEW: Store in global history
+    store_correction_in_history(result);
+
+    return result->converged;
+}
+
+static void store_correction_in_history(FeedbackResult *result)
+{
+    // Copy result to history buffer (circular buffer)
+    memcpy(&correction_tracker.history[correction_tracker.history_index],
+           result, sizeof(FeedbackResult));
+
+    correction_tracker.history_index = (correction_tracker.history_index + 1) % MAX_CORRECTION_HISTORY;
+
+    if (correction_tracker.history_count < MAX_CORRECTION_HISTORY) {
+        correction_tracker.history_count++;
+    }
+}
+
+/**
+ * @brief Print debug information for CMD_DEVICE_SETTINGS payload
+ */
+static void print_device_settings_debug(uint8_t *payload, uint8_t len, comm_interface_t interface)
+{
+    char debug_msg[128];
+    int pos = 0;
+
+    snprintf(debug_msg, sizeof(debug_msg), "=== CMD_DEVICE_SETTINGS DEBUG (len=%d) ===\r\n", len);
+    uart_send_to_interface(debug_msg, interface);
+
+    if (len < 9) {
+        uart_send_to_interface("ERROR: Payload too short for device settings\r\n", interface);
+        return;
+    }
+
+    // Parse and print basic settings
+    int16_t freefall = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+    int16_t hptf = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+    uint8_t feedback_enabled = payload[pos++];
+    uint8_t feedback_tolerance_scaled = payload[pos++];
+    uint8_t harmonic_val = payload[pos++];
+    uint16_t duration_ms = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+    uint8_t element_count = payload[pos++];
+
+    snprintf(debug_msg, sizeof(debug_msg), "Freefall: %d\r\n", freefall);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "HPTF: %d\r\n", hptf);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Feedback Enabled: %s\r\n", feedback_enabled ? "YES" : "NO");
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Feedback Tolerance: %.3f V\r\n",
+             (float)feedback_tolerance_scaled / 1000.0f);
+    uart_send_to_interface(debug_msg, interface);
+
+    const char* harmonic_str = "UNKNOWN";
+    switch(harmonic_val) {
+        case 0: harmonic_str = "FULL"; break;
+        case 1: harmonic_str = "HALF"; break;
+        case 2: harmonic_str = "QUARTER"; break;
+    }
+    snprintf(debug_msg, sizeof(debug_msg), "Harmonic: %s (%d)\r\n", harmonic_str, harmonic_val);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Duration: %d ms\r\n", duration_ms);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Element Count: %d\r\n", element_count);
+    uart_send_to_interface(debug_msg, interface);
+
+    // Print element data if available
+    for (uint8_t i = 0; i < element_count && pos < (len - 11); i++) {
+        if (pos + 11 > len) break;
+
+        char symbol[4] = {0};
+        memcpy(symbol, &payload[pos], 3);
+        pos += 3;
+
+        float vout_base;
+        memcpy(&vout_base, &payload[pos], sizeof(float));
+        pos += sizeof(float);
+
+        uint32_t freq = payload[pos] | (payload[pos+1] << 8) |
+                       (payload[pos+2] << 16) | (payload[pos+3] << 24);
+        pos += 4;
+
+        snprintf(debug_msg, sizeof(debug_msg), "Element[%d]: %s, Vout=%.3f V, Freq=%lu Hz\r\n",
+                 i, symbol, vout_base, freq);
+        uart_send_to_interface(debug_msg, interface);
+    }
+
+    uart_send_to_interface("=== END DEVICE_SETTINGS DEBUG ===\r\n", interface);
+}
+
+/**
+ * @brief Print debug information for CMD_FEEDBACK_INFO payload
+ */
+static void print_feedback_info_debug(uint8_t *payload, uint8_t len, comm_interface_t interface)
+{
+    char debug_msg[128];
+    int pos = 0;
+
+    snprintf(debug_msg, sizeof(debug_msg), "=== CMD_FEEDBACK_INFO DEBUG (len=%d) ===\r\n", len);
+    uart_send_to_interface(debug_msg, interface);
+
+    if (len < 47) {
+        snprintf(debug_msg, sizeof(debug_msg), "ERROR: Payload too short for feedback info (expected 47, got %d)\r\n", len);
+        uart_send_to_interface(debug_msg, interface);
+        return;
+    }
+
+    // Parse feedback configuration
+    uint8_t feedback_enabled = payload[pos++];
+
+    float feedback_tolerance;
+    memcpy(&feedback_tolerance, &payload[pos], sizeof(float));
+    pos += sizeof(float);
+
+    uint8_t correction_factor_scaled = payload[pos++];
+    uint8_t max_iterations = payload[pos++];
+
+    uint16_t settle_delay = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+
+    // Parse statistics
+    uint32_t total_corrections, successful_corrections, failed_corrections, total_iterations;
+    memcpy(&total_corrections, &payload[pos], sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    memcpy(&successful_corrections, &payload[pos], sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    memcpy(&failed_corrections, &payload[pos], sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    memcpy(&total_iterations, &payload[pos], sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    float avg_error_before, avg_error_after;
+    memcpy(&avg_error_before, &payload[pos], sizeof(float));
+    pos += sizeof(float);
+    memcpy(&avg_error_after, &payload[pos], sizeof(float));
+    pos += sizeof(float);
+
+    // Parse hardware config
+    float adc_vref;
+    memcpy(&adc_vref, &payload[pos], sizeof(float));
+    pos += sizeof(float);
+
+    uint16_t adc_res = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+    uint16_t dac_res = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+
+    float last_target_voltage;
+    memcpy(&last_target_voltage, &payload[pos], sizeof(float));
+    pos += sizeof(float);
+
+    uint16_t success_rate_percent = payload[pos] | (payload[pos+1] << 8);
+    pos += 2;
+
+    // Print all the information
+    snprintf(debug_msg, sizeof(debug_msg), "Feedback Enabled: %s\r\n", feedback_enabled ? "YES" : "NO");
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Feedback Tolerance: %.3f V\r\n", feedback_tolerance);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Correction Factor: %.2f%% (scaled: %d)\r\n",
+             (float)correction_factor_scaled / 100.0f * 100.0f, correction_factor_scaled);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Max Iterations: %d\r\n", max_iterations);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Settle Delay: %d ms\r\n", settle_delay);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Total Corrections: %lu\r\n", total_corrections);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Successful: %lu\r\n", successful_corrections);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Failed: %lu\r\n", failed_corrections);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Total Iterations: %lu\r\n", total_iterations);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Avg Error Before: %.4f V\r\n", avg_error_before);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Avg Error After: %.4f V\r\n", avg_error_after);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "ADC Vref: %.1f V\r\n", adc_vref);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "ADC Resolution: %d\r\n", adc_res);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "DAC Resolution: %d\r\n", dac_res);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Last Target Voltage: %.3f V\r\n", last_target_voltage);
+    uart_send_to_interface(debug_msg, interface);
+
+    snprintf(debug_msg, sizeof(debug_msg), "Success Rate: %.2f%% (scaled: %d)\r\n",
+             (float)success_rate_percent / 100.0f, success_rate_percent);
+    uart_send_to_interface(debug_msg, interface);
+
+    uart_send_to_interface("=== END FEEDBACK_INFO DEBUG ===\r\n", interface);
+}
+
+/**
+ * @brief Print raw hex payload for debugging
+ */
+static void print_hex_payload(uint8_t *payload, uint8_t len, comm_interface_t interface)
+{
+    char debug_msg[128];
+    char hex_str[8];
+
+    uart_send_to_interface("Raw Payload (HEX): ", interface);
+
+    for (uint8_t i = 0; i < len; i++) {
+        snprintf(hex_str, sizeof(hex_str), "%02X ", payload[i]);
+        uart_send_to_interface(hex_str, interface);
+
+        // Add newline every 16 bytes for readability
+        if ((i + 1) % 16 == 0) {
+            uart_send_to_interface("\r\n                   ", interface);
+        }
+    }
+    uart_send_to_interface("\r\n", interface);
+}
+
+/* System Clock Configuration -----------------------------------------------*/
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /*AXI clock gating */
+  RCC->CKGAENR = 0xE003FFFF;
+
+  /** Supply configuration update enable
+  */
+  HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY);
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = 64;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 22;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 4096;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
+                              |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_16B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DR;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  sConfig.OffsetSignedSaturation = DISABLE;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief DAC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC1_Init(void)
+{
+
+  /* USER CODE BEGIN DAC1_Init 0 */
+
+  /* USER CODE END DAC1_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC1_Init 1 */
+
+  /* USER CODE END DAC1_Init 1 */
+
+  /** DAC Initialization
+  */
+  hdac1.Instance = DAC1;
+  if (HAL_DAC_Init(&hdac1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** DAC channel OUT1 config
+  */
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_ENABLE;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC1_Init 2 */
+
+  /* USER CODE END DAC1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART10 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART10_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART10_Init 0 */
+
+  /* USER CODE END USART10_Init 0 */
+
+  /* USER CODE BEGIN USART10_Init 1 */
+
+  /* USER CODE END USART10_Init 1 */
+  huart10.Instance = USART10;
+  huart10.Init.BaudRate = 115200;
+  huart10.Init.WordLength = UART_WORDLENGTH_8B;
+  huart10.Init.StopBits = UART_STOPBITS_1;
+  huart10.Init.Parity = UART_PARITY_NONE;
+  huart10.Init.Mode = UART_MODE_TX_RX;
+  huart10.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart10.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart10.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart10.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart10.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart10) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart10, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart10, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart10) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART10_Init 2 */
+
+  /* USER CODE END USART10_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD3_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LD1_Pin LD3_Pin */
+  GPIO_InitStruct.Pin = LD1_Pin|LD3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : STLINK_RX_Pin STLINK_TX_Pin */
+  GPIO_InitStruct.Pin = STLINK_RX_Pin|STLINK_TX_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+    // Configure PA4 for DAC output
+    GPIO_InitStruct.Pin = GPIO_PIN_4;  // PA4 = DAC1_OUT1
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // Configure PA2 for ADC input
+    GPIO_InitStruct.Pin = GPIO_PIN_2;  // PA2 = ADC1_IN2
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+ /* MPU Configuration */
+
+void MPU_Config(void)
+{
+  MPU_Region_InitTypeDef MPU_InitStruct = {0};
+
+  /* Disables the MPU */
+  HAL_MPU_Disable();
+
+  /** Initializes and configures the Region and the memory to be protected
+  */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+  MPU_InitStruct.BaseAddress = 0x0;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
+  MPU_InitStruct.SubRegionDisable = 0x87;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+  /* Enables the MPU */
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

@@ -2,23 +2,87 @@
 function getFeedbackInfoFromSTM32(preferredTransport) {
   return new Promise(async (resolve, reject) => {
     try {
-      // Listen for feedback-info event ONCE
-      const timeout = setTimeout(() => {
-        if (ioRef) ioRef.off('feedback-info', handler);
-        reject(new Error('Timeout waiting for feedback info from STM32'));
-      }, 3000);
+      // Attach event handler BEFORE sending the command
       function handler(data) {
         clearTimeout(timeout);
         if (ioRef) ioRef.off('feedback-info', handler);
         console.log('[FeedbackInfo] feedback-info event received:', data);
         resolve(data); // Return the full structured object
       }
-      if (ioRef) ioRef.on('feedback-info', handler);
-      await sendCommandToSTM32(CMD_GET_FEEDBACK_INFO, undefined, preferredTransport);
+      if (ioRef) {
+        ioRef.on('feedback-info', handler);
+        console.log('[FeedbackInfo] Event handler attached for feedback-info');
+      }
+      // Timeout for response
+      const timeout = setTimeout(() => {
+        if (ioRef) ioRef.off('feedback-info', handler);
+        reject(new Error('Timeout waiting for feedback info from STM32'));
+      }, 3000);
+  // Send get device ready and feedback info requests as a single combined binary message
+  const readyPacket = buildPacket(CMD_GET_DEVICE_READY);
+  const feedbackPacket = Buffer.from([0xAA, 0x09, 0x00, 0xA3, 0x55]);
+  const combined = Buffer.concat([readyPacket, feedbackPacket]);
+  console.log(`[SEND] Combined DeviceReady+FeedbackInfoRequest: ${combined.toString('hex')} via ${preferredTransport || 'auto'}`);
+  const result = sendPacket(combined, preferredTransport);
+  console.log(`[SEND] Combined sent via ${result.via || 'unknown'}: ${result.sent ? 'OK' : 'FAIL'} (${result.error || ''})`);
     } catch (err) {
       reject(err);
     }
   });
+}
+// --- FEEDBACK INFO PACKET CONSTANTS ---
+const FEEDBACK_INFO_CMD = 0x0A;
+const FEEDBACK_INFO_PAYLOAD_LEN = 47;
+const FEEDBACK_INFO_PACKET_LEN = 1 + 1 + 1 + FEEDBACK_INFO_PAYLOAD_LEN + 1 + 1; // header+cmd+len+payload+checksum+end
+
+let uartFeedbackBuffer = Buffer.alloc(0);
+let tcpBuffer = Buffer.alloc(0);
+let udpBuffer = Buffer.alloc(0);
+
+// --- SEND FEEDBACK INFO REQUEST ---
+function sendFeedbackInfoRequest(preferredTransport) {
+  // Send: AA 09 00 A3 55
+  const FEEDBACK_INFO_REQUEST = Buffer.from([0xAA, 0x09, 0x00, 0xA3, 0x55]);
+  console.log(`[SEND] FeedbackInfoRequest: ${FEEDBACK_INFO_REQUEST.toString('hex')} via ${preferredTransport || 'auto'}`);
+  if (preferredTransport === 'serial' || !preferredTransport) {
+    if (serialPort) {
+      serialPort.write(FEEDBACK_INFO_REQUEST);
+      console.log('[SEND] FeedbackInfoRequest sent via serial');
+    }
+  } else {
+    // fallback to old sendPacket for other transports
+    const result = sendPacket(FEEDBACK_INFO_REQUEST, preferredTransport);
+    console.log(`[SEND] FeedbackInfoRequest sent via ${result.via || 'unknown'}: ${result.sent ? 'OK' : 'FAIL'} (${result.error || ''})`);
+  }
+}
+
+// --- UART and WS Feedback Buffer Handlers (must be after serialPort/wsClient declarations) ---
+function attachFeedbackBufferHandlers(port) {
+  if (port) {
+    console.log('[SERIAL][DEBUG] Attaching serialPort data event handler...');
+    port.on('data', (data) => {
+      console.log('[SERIAL][EVENT] serialPort.on("data") fired');
+      console.log('[SERIAL][RAW]', data.toString('hex'), 'len:', data.length);
+      uartFeedbackBuffer = Buffer.concat([uartFeedbackBuffer, data]);
+      console.log('[SERIAL][BUFFER]', uartFeedbackBuffer.toString('hex'), 'len:', uartFeedbackBuffer.length);
+      uartFeedbackBuffer = processFeedbackBuffer(uartFeedbackBuffer, (payload) => {
+        console.log('[SERIAL][PARSED PAYLOAD]', payload.toString('hex'), 'len:', payload.length);
+        if (ioRef) ioRef.emit('feedback-info', payload);
+      });
+    });
+  } else {
+    console.log('[SERIAL][DEBUG] serialPort is not defined when trying to attach handler!');
+  }
+  if (wsClient) {
+    wsClient.on('message', (data) => {
+      if (Buffer.isBuffer(data)) {
+        wsFeedbackBuffer = Buffer.concat([wsFeedbackBuffer, data]);
+        wsFeedbackBuffer = processFeedbackBuffer(wsFeedbackBuffer, (payload) => {
+          if (ioRef) ioRef.emit('feedback-info', payload);
+        });
+      }
+    });
+  }
 }
 // Wait for CMD_DEVICE_SETTINGS response and return parsed settings
 function getDeviceSettingsFromSTM32(preferredTransport) {
@@ -47,7 +111,7 @@ const TestLog = require('../models/HistoryLog');
 const { SerialPort } = require('serialport');
 const net = require('net');
 const WebSocket = require('ws');
-const noble = require('@abandonware/noble');
+// const noble = require('@abandonware/noble'); // Bluetooth disabled
 
 // STM32/ESP32 protocol constants
 const PKT_HEADER = 0xAA;
@@ -73,7 +137,9 @@ const CMD_GET_STAT = 0x24;          // Request statistics
 const CMD_STAT_DATA = 0x25;         // Response with statistics
 
 let serialPort;
-let tcpClient;
+
+// Import setupSerial from separate file
+const { setupSerial } = require('./setupSerial');
 let ioRef;
 let wsClient;
 let wsPingInterval;
@@ -81,132 +147,146 @@ let wsLastPongAt = 0;
 
 // Buffer for incoming binary data
 let serialBuffer = Buffer.alloc(0);
-let tcpBuffer = Buffer.alloc(0);
 let wsBuffer = Buffer.alloc(0);
 
 
-// Transport mode: 'auto' | 'wifi' | 'uart' | 'tcp' | 'bluetooth'
+// Transport mode: 'auto' | 'wifi' | 'uart' | 'bluetooth'
 let transportMode = 'auto';
 
-// BLE variables
-let blePeripheral = null;
-let bleCharacteristic = null;
-let bleConnected = false;
-let bleStatus = { connected: false, scanning: false, error: null };
-
-// Replace with your STM32 BLE UUIDs
-const SERVICE_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
-const CHARACTERISTIC_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
-function setupBLE(io) {
-  ioRef = io;
-  noble.on('stateChange', async (state) => {
-    if (state === 'poweredOn') {
-      bleStatus.scanning = true;
-      noble.startScanning([SERVICE_UUID], false);
-    } else {
-      noble.stopScanning();
-      bleStatus.scanning = false;
-    }
-  });
-
-  noble.on('discover', async (peripheral) => {
-    if (blePeripheral) return; // Already connected
-    blePeripheral = peripheral;
-    noble.stopScanning();
-    bleStatus.scanning = false;
-    peripheral.connect((err) => {
-      if (err) {
-        bleStatus.error = err.message;
-        io.emit('device-error', 'BLE connect error: ' + err.message);
-        return;
-      }
-      bleConnected = true;
-      bleStatus.connected = true;
-      io.emit('device-status', { online: true, via: 'bluetooth', status: 'ble_connected', timestamp: new Date().toISOString() });
-      peripheral.discoverSomeServicesAndCharacteristics([SERVICE_UUID], [CHARACTERISTIC_UUID], (err, services, characteristics) => {
-        if (err || !characteristics.length) {
-          bleStatus.error = err ? err.message : 'Characteristic not found';
-          io.emit('device-error', 'BLE discover error: ' + bleStatus.error);
-          return;
-        }
-        bleCharacteristic = characteristics[0];
-        // Subscribe to notifications
-        bleCharacteristic.on('data', (data, isNotification) => {
-          processIncomingBuffer(Buffer.from(data), 'bluetooth');
-        });
-        bleCharacteristic.subscribe((err) => {
-          if (err) io.emit('device-error', 'BLE subscribe error: ' + err.message);
-        });
-      });
-    });
-    peripheral.on('disconnect', () => {
-      bleConnected = false;
-      bleStatus.connected = false;
-      blePeripheral = null;
-      bleCharacteristic = null;
-      io.emit('device-status', { online: false, via: 'bluetooth', status: 'ble_disconnected', timestamp: new Date().toISOString() });
-      noble.startScanning([SERVICE_UUID], false);
-      bleStatus.scanning = true;
-    });
-  });
-}
+// BLE variables and setupBLE are commented out (Bluetooth disabled)
+// let blePeripheral = null;
+// let bleCharacteristic = null;
+// let bleConnected = false;
+// let bleStatus = { connected: false, scanning: false, error: null };
+// const SERVICE_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
+// const CHARACTERISTIC_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
+// function setupBLE(io) {
+//   ioRef = io;
+//   noble.on('stateChange', async (state) => {
+//     if (state === 'poweredOn') {
+//       bleStatus.scanning = true;
+//       noble.startScanning([SERVICE_UUID], false);
+//     } else {
+//       noble.stopScanning();
+//       bleStatus.scanning = false;
+//     }
+//   });
+//   noble.on('discover', async (peripheral) => {
+//     if (blePeripheral) return; // Already connected
+//     blePeripheral = peripheral;
+//     noble.stopScanning();
+//     bleStatus.scanning = false;
+//     peripheral.connect((err) => {
+//       if (err) {
+//         bleStatus.error = err.message;
+//         io.emit('device-error', 'BLE connect error: ' + err.message);
+//         return;
+//       }
+//       bleConnected = true;
+//       bleStatus.connected = true;
+//       io.emit('device-status', { online: true, via: 'bluetooth', status: 'ble_connected', timestamp: new Date().toISOString() });
+//       peripheral.discoverSomeServicesAndCharacteristics([SERVICE_UUID], [CHARACTERISTIC_UUID], (err, services, characteristics) => {
+//         if (err || !characteristics.length) {
+//           bleStatus.error = err ? err.message : 'Characteristic not found';
+//           io.emit('device-error', 'BLE discover error: ' + bleStatus.error);
+//           return;
+//         }
+//         bleCharacteristic = characteristics[0];
+//         // Subscribe to notifications
+//         bleCharacteristic.on('data', (data, isNotification) => {
+//           processIncomingBuffer(Buffer.from(data), 'bluetooth');
+//         });
+//         bleCharacteristic.subscribe((err) => {
+//           if (err) io.emit('device-error', 'BLE subscribe error: ' + err.message);
+//         });
+//       });
+//     });
+//     peripheral.on('disconnect', () => {
+//       bleConnected = false;
+//       bleStatus.connected = false;
+//       blePeripheral = null;
+//       bleCharacteristic = null;
+//       io.emit('device-status', { online: false, via: 'bluetooth', status: 'ble_disconnected', timestamp: new Date().toISOString() });
+//       noble.startScanning([SERVICE_UUID], false);
+//       bleStatus.scanning = true;
+//     });
+//   });
+// }
 
 function normalizeTransportName(name) {
   if (!name) return undefined;
   const n = String(name).toLowerCase();
   if (n === 'wifi' || n === 'ws' || n === 'websocket') return 'wifi';
   if (n === 'uart' || n === 'serial' || n === 'com') return 'uart';
-  if (n === 'tcp' || n === 'net') return 'tcp';
+  if (n === 'tcp') return 'tcp';
+  if (n === 'udp') return 'udp';
   if (n === 'bluetooth' || n === 'ble') return 'bluetooth';
+let tcpClient;
+let udpSocket;
+let udpTarget;
+function isTcpReady() {
+  return !!(tcpClient && tcpClient.writable);
+}
+
+function isUdpReady() {
+  return !!(udpSocket);
+}
+function setupTCP(io) {
+  ioRef = io;
+  const tcpHost = process.env.TCP_HOST || '127.0.0.1';
+  const tcpPort = parseInt(process.env.TCP_PORT || '8080', 10);
+  tcpClient = new net.Socket();
+  tcpClient.connect(tcpPort, tcpHost, () => {
+    console.log('TCP connected to', tcpHost, tcpPort);
+    ioRef.emit('device-status', { online: true, via: 'tcp', status: 'tcp_connected', timestamp: new Date().toISOString() });
+  });
+  tcpClient.on('data', (data) => {
+    tcpBuffer = Buffer.concat([tcpBuffer, data]);
+    processIncomingBuffer(tcpBuffer, 'tcp');
+  });
+  tcpClient.on('close', () => {
+    ioRef.emit('device-status', { online: false, via: 'tcp', status: 'tcp_disconnected', timestamp: new Date().toISOString() });
+    setTimeout(() => setupTCP(io), 2000);
+  });
+  tcpClient.on('error', (err) => {
+    ioRef.emit('device-error', `tcp-error: ${err.message}`);
+  });
+}
+
+function setupUDP(io) {
+  ioRef = io;
+  const udpPort = parseInt(process.env.UDP_PORT || '8081', 10);
+  udpSocket = dgram.createSocket('udp4');
+  udpSocket.on('message', (msg, rinfo) => {
+    udpBuffer = Buffer.concat([udpBuffer, msg]);
+    processIncomingBuffer(udpBuffer, 'udp');
+    udpTarget = { address: rinfo.address, port: rinfo.port };
+  });
+  udpSocket.on('error', (err) => {
+    ioRef.emit('device-error', `udp-error: ${err.message}`);
+  });
+  udpSocket.bind(udpPort, () => {
+    console.log('UDP server listening on port', udpPort);
+    ioRef.emit('device-status', { online: true, via: 'udp', status: 'udp_listening', timestamp: new Date().toISOString() });
+  });
+}
   if (n === 'auto') return 'auto';
   return undefined;
+}
+
 function isBLEReady() {
   return !!(bleCharacteristic && bleConnected);
-}
 }
 
 function isWsReady() {
   return !!(wsClient && wsClient.readyState === WebSocket.OPEN);
 }
-function isTcpReady() {
-  return !!(tcpClient && !tcpClient.destroyed);
-}
+// TCP removed
 function isSerialReady() {
   return !!(serialPort && serialPort.isOpen);
 }
 
-function setupSerial(io) {
-  ioRef = io;
-  if (!process.env.SERIAL_PORT) return;
-  serialPort = new SerialPort({
-    path: process.env.SERIAL_PORT,
-    baudRate: parseInt(process.env.SERIAL_BAUD) || 115200,
-    autoOpen: true
-  });
-  serialPort.on('data', data => {
-    serialBuffer = Buffer.concat([serialBuffer, data]);
-    processIncomingBuffer(serialBuffer, 'serial');
-  });
-  serialPort.on('error', err => {
-    io.emit('device-error', err.message);
-  });
-}
-
-function setupTCP(io) {
-  ioRef = io;
-  if (!process.env.TCP_HOST || !process.env.TCP_PORT) return;
-  tcpClient = new net.Socket();
-  tcpClient.connect(parseInt(process.env.TCP_PORT), process.env.TCP_HOST, () => {
-    console.log('TCP connected to STM32');
-  });
-  tcpClient.on('data', data => {
-    tcpBuffer = Buffer.concat([tcpBuffer, data]);
-    processIncomingBuffer(tcpBuffer, 'tcp');
-  });
-  tcpClient.on('error', err => {
-    ioRef.emit('device-error', err.message);
-  });
-}
+// TCP removed
 
 function setupWS(io) {
   ioRef = io;
@@ -309,8 +389,7 @@ function processIncomingBuffer(buffer, source) {
   // Remove processed bytes from the appropriate buffer
   if (source === 'serial') {
     serialBuffer = buffer.slice(offset);
-  } else if (source === 'tcp') {
-    tcpBuffer = buffer.slice(offset);
+  // TCP removed
   } else if (source === 'ws') {
     wsBuffer = buffer.slice(offset);
   }
@@ -429,8 +508,12 @@ function handlePacket({ cmd, payload, len, source }) {
     }
     case CMD_FEEDBACK_INFO: {
       debugLogIncomingPacket(CMD_FEEDBACK_INFO, payload);
+      console.log('[FeedbackInfo] Raw payload:', payload.toString('hex'), 'Length:', payload.length);
       // Parse feedback info payload as per STM32 structure
       try {
+        if (payload.length !== 47) {
+          throw new Error('Feedback info payload length is not 47 bytes');
+        }
         let pos = 0;
         const feedback_enabled = payload.readUInt8(pos); pos += 1;
         const feedback_tolerance = payload.readFloatLE(pos); pos += 4;
@@ -472,7 +555,7 @@ function handlePacket({ cmd, payload, len, source }) {
         console.log('[FeedbackInfo] Parsed:', parsed);
         ioRef.emit('feedback-info', parsed);
       } catch (err) {
-        console.error('[FeedbackInfo] Error parsing feedback-info payload:', err, 'Payload:', payload.toString('hex'));
+        console.error('[FeedbackInfo] Error parsing feedback-info payload:', err, 'Payload:', payload.toString('hex'), 'Length:', payload.length);
         ioRef.emit('feedback-info', {
           error: 'Malformed feedback-info payload',
           raw: payload.toString('hex'),
@@ -554,47 +637,16 @@ async function getDeviceStatusFromSTM32(preferredTransport) {
 }
 
 async function sendCommandToSTM32(cmd, payload, preferredTransport) {
-  // Send a command packet to STM32 (TCP preferred, fallback to serial)
+  // Always send a get device ready packet immediately before every command
+  const readyPacket = buildPacket(CMD_GET_DEVICE_READY);
+  console.log(`[SEND] DeviceReady (pre-command): ${readyPacket.toString('hex')} via ${preferredTransport || 'auto'}`);
+  const readyResult = sendPacket(readyPacket, preferredTransport);
+  console.log(`[SEND] DeviceReady (pre-command) sent via ${readyResult.via || 'unknown'}: ${readyResult.sent ? 'OK' : 'FAIL'} (${readyResult.error || ''})`);
+  // Now send the actual command packet
   const packet = buildPacket(cmd, payload);
+  console.log(`[SEND] Command: CMD=0x${cmd.toString(16).padStart(2, '0')} Payload=${payload ? payload.toString('hex') : ''} via ${preferredTransport || 'auto'}`);
   const result = sendPacket(packet, preferredTransport);
-  
-  // For commands that require device ready response, wait for ready signal
-  if (cmd === CMD_SEND_SW_PARAMETERS || cmd === CMD_SET_DEVICE_SETTINGS) {
-    // Wait for device ready response
-    return new Promise((resolve, reject) => {
-      let resolved = false;
-      const handler = data => {
-        if (data.ready) {
-          resolved = true;
-          ioRef.off('device-ready', handler);
-          
-          // After receiving device ready, start listening for heartbeat packets again
-          console.log('Device ready received, resuming heartbeat monitoring...');
-          
-          // Emit a status update to indicate ready for next input
-          ioRef.emit('device-status', { 
-            online: true, 
-            ready: true,
-            status: 'ready_for_next_input',
-            message: 'Device ready for next command',
-            timestamp: new Date().toISOString()
-          });
-          
-          resolve({ ...result, deviceReady: true, readyPayload: data.payload, status: 'ready_for_next_input' });
-        }
-      };
-      ioRef.on('device-ready', handler);
-      
-      // Timeout after 5 seconds
-      setTimeout(() => {
-        if (!resolved) {
-          ioRef.off('device-ready', handler);
-          resolve({ ...result, deviceReady: false, error: 'Device ready timeout' });
-        }
-      }, 5000);
-    });
-  }
-  
+  console.log(`[SEND] Command sent via ${result.via || 'unknown'}: ${result.sent ? 'OK' : 'FAIL'} (${result.error || ''})`);
   return result;
 }
 
@@ -611,10 +663,7 @@ function sendPacket(packet, preferredTransport) {
     if (isSerialReady()) { serialPort.write(packet); return { sent: true, via: 'serial' }; }
     return { sent: false, error: 'UART/Serial not connected' };
   }
-  if (mode === 'tcp') {
-    if (isTcpReady()) { tcpClient.write(packet); return { sent: true, via: 'tcp' }; }
-    return { sent: false, error: 'TCP not connected' };
-  }
+  // TCP removed
   if (mode === 'bluetooth') {
     if (isBLEReady()) {
       bleCharacteristic.write(packet, false, (err) => {
@@ -625,9 +674,9 @@ function sendPacket(packet, preferredTransport) {
     return { sent: false, error: 'Bluetooth not connected' };
   }
 
-  // Auto mode: prefer WS -> TCP -> Serial -> BLE
+  // Auto mode: prefer WS -> Serial -> BLE
   if (isWsReady()) { wsClient.send(packet, { binary: true }); return { sent: true, via: 'ws' }; }
-  if (isTcpReady()) { tcpClient.write(packet); return { sent: true, via: 'tcp' }; }
+  // TCP removed
   if (isSerialReady()) { serialPort.write(packet); return { sent: true, via: 'serial' }; }
   if (isBLEReady()) {
     bleCharacteristic.write(packet, false, (err) => {
@@ -645,9 +694,7 @@ function getTransportStatus() {
       readyState: wsClient ? wsClient.readyState : undefined,
       lastPongAt: wsLastPongAt || undefined
     },
-    tcp: {
-      connected: !!(tcpClient && !tcpClient.destroyed)
-    },
+  // TCP removed
     serial: {
       connected: !!(serialPort && serialPort.isOpen)
     },
@@ -703,11 +750,63 @@ function getTransportMode() {
   return transportMode;
 }
 
+
+function processFeedbackBuffer(buffer, emitEvent) {
+  while (buffer.length >= FEEDBACK_INFO_PACKET_LEN) {
+    if (buffer[0] !== 0xAA) {
+      buffer = buffer.slice(1);
+      continue;
+    }
+    if (buffer[1] !== FEEDBACK_INFO_CMD || buffer[2] !== FEEDBACK_INFO_PAYLOAD_LEN) {
+      buffer = buffer.slice(1);
+      continue;
+    }
+    if (buffer[FEEDBACK_INFO_PACKET_LEN - 1] !== 0x55) {
+      buffer = buffer.slice(1);
+      continue;
+    }
+    let checksum = 0;
+    for (let i = 0; i < FEEDBACK_INFO_PACKET_LEN - 2; i++) {
+      checksum ^= buffer[i];
+    }
+    if (checksum !== buffer[FEEDBACK_INFO_PACKET_LEN - 2]) {
+      buffer = buffer.slice(1);
+      continue;
+    }
+    const payload = buffer.slice(3, 3 + FEEDBACK_INFO_PAYLOAD_LEN);
+    emitEvent(payload);
+    buffer = buffer.slice(FEEDBACK_INFO_PACKET_LEN);
+  }
+  return buffer;
+}
+
+
+// --- Feedback Info Buffer Handlers (runtime code) ---
+if (serialPort) {
+  serialPort.on('data', (data) => {
+    uartFeedbackBuffer = Buffer.concat([uartFeedbackBuffer, data]);
+    uartFeedbackBuffer = processFeedbackBuffer(uartFeedbackBuffer, (payload) => {
+      if (ioRef) ioRef.emit('feedback-info', payload);
+    });
+  });
+}
+
+let wsFeedbackBuffer = Buffer.alloc(0);
+if (wsClient) {
+  wsClient.on('message', (data) => {
+    if (Buffer.isBuffer(data)) {
+      wsFeedbackBuffer = Buffer.concat([wsFeedbackBuffer, data]);
+      wsFeedbackBuffer = processFeedbackBuffer(wsFeedbackBuffer, (payload) => {
+        if (ioRef) ioRef.emit('feedback-info', payload);
+      });
+    }
+  });
+}
+
 module.exports = {
   setupSerial,
-  setupTCP,
   setupWS,
-  setupBLE,
+  // setupBLE, // Bluetooth disabled
   getDeviceStatusFromSTM32,
   sendCommandToSTM32,
   requestDeviceReady,
@@ -718,6 +817,7 @@ module.exports = {
   getTransportMode,
   getDeviceSettingsFromSTM32,
   getFeedbackInfoFromSTM32,
+  attachFeedbackBufferHandlers,
   CMD_GET_DEVICE_READY,
   CMD_SEND_SW_PARAMETERS,
   CMD_SET_DEVICE_SETTINGS,

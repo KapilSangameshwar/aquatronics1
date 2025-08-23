@@ -1,9 +1,38 @@
+// Get all registered devices
+exports.getRegisteredDevices = async (req, res, next) => {
+  try {
+    const devices = await RegisteredDevice.find({});
+    res.json(devices);
+  } catch (err) {
+    next(err);
+  }
+};
+const RegisteredDevice = require('../models/RegisteredDevice');
+// Register a device (deviceId, customName)
+exports.registerDevice = async (req, res, next) => {
+  try {
+    const { deviceId, customName, latitude, longitude } = req.body;
+    if (!deviceId || !customName) {
+      return res.status(400).json({ message: 'deviceId and customName are required.' });
+    }
+    // Upsert: if device exists, update name and location; else create
+    const device = await RegisteredDevice.findOneAndUpdate(
+      { deviceId },
+      { deviceId, customName, latitude, longitude },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    res.json({ message: 'Device registered successfully.', device });
+  } catch (err) {
+    next(err);
+  }
+};
 const {
   sendCommandToSTM32,
   getDeviceStatusFromSTM32,
   requestDeviceReady,
   buildPacket,
   sendPacket,
+  getFeedbackInfoFromSTM32,
   CMD_GET_DEVICE_READY,
   CMD_SEND_SW_PARAMETERS,
   CMD_SET_DEVICE_SETTINGS,

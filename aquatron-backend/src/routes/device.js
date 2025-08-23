@@ -1,6 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate, authorize } = require('../middleware/auth');
+const { getRegisteredDevices, registerDevice } = require('../controllers/deviceController');
+// Get all registered devices
+router.get('/registered', authenticate, authorize(['superadmin', 'admin']), getRegisteredDevices);
+// Register a device (deviceId, customName)
+router.post('/register', authenticate, authorize(['superadmin', 'admin']), registerDevice);
 const {
   getDeviceStatus,
   sendDeviceCommand,
@@ -59,5 +64,14 @@ router.get('/transport-status', authenticate, authorize(['superadmin', 'admin', 
 // Transport mode (auto | wifi | uart | tcp)
 router.get('/transport-mode', authenticate, authorize(['superadmin', 'admin', 'user']), getTransportMode);
 router.post('/transport-mode', authenticate, authorize(['superadmin', 'admin']), setTransportMode);
+
+
+// Registered device management
+const registeredDeviceController = require('../controllers/registeredDeviceController');
+router.get('/devices/registered', authenticate, authorize(['superadmin', 'admin']), registeredDeviceController.getRegisteredDevices);
+router.post('/devices/register', authenticate, authorize(['superadmin', 'admin']), registeredDeviceController.registerDevice);
+router.put('/devices/register/:id', authenticate, authorize(['superadmin', 'admin']), registeredDeviceController.updateRegisteredDevice);
+router.delete('/devices/register/:id', authenticate, authorize(['superadmin', 'admin']), registeredDeviceController.deleteRegisteredDevice);
+router.get('/devices/online', authenticate, authorize(['superadmin', 'admin']), registeredDeviceController.getOnlineDevices);
 
 module.exports = router;
