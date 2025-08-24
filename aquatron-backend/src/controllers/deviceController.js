@@ -1,8 +1,32 @@
 // Get all registered devices
+// In-memory online device tracking
+const onlineDevices = new Set();
+
+// Listen for device-status events to update online status
+function setupDeviceStatusListener(io) {
+  io.on('connection', (socket) => {
+    socket.on('device-status', (data) => {
+      if (data && data.deviceId) {
+        if (data.online) {
+          onlineDevices.add(data.deviceId);
+        } else {
+          onlineDevices.delete(data.deviceId);
+        }
+      }
+    });
+  });
+}
+exports.setupDeviceStatusListener = setupDeviceStatusListener;
+
 exports.getRegisteredDevices = async (req, res, next) => {
   try {
     const devices = await RegisteredDevice.find({});
-    res.json(devices);
+    // Add online status to each device
+    const devicesWithStatus = devices.map(d => ({
+      ...d.toObject(),
+      online: onlineDevices.has(d.deviceId)
+    }));
+    res.json(devicesWithStatus);
   } catch (err) {
     next(err);
   }

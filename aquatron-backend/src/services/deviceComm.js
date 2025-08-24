@@ -111,7 +111,12 @@ const TestLog = require('../models/HistoryLog');
 const { SerialPort } = require('serialport');
 const net = require('net');
 const WebSocket = require('ws');
-// const noble = require('@abandonware/noble'); // Bluetooth disabled
+let noble = null;
+try {
+  noble = require('@abandonware/noble');
+} catch (e) {
+  console.warn('[BLE] @abandonware/noble not installed. BLE features are disabled.');
+}
 
 // STM32/ESP32 protocol constants
 const PKT_HEADER = 0xAA;
@@ -154,64 +159,68 @@ let wsBuffer = Buffer.alloc(0);
 let transportMode = 'auto';
 
 // BLE variables and setupBLE are commented out (Bluetooth disabled)
-// let blePeripheral = null;
-// let bleCharacteristic = null;
-// let bleConnected = false;
-// let bleStatus = { connected: false, scanning: false, error: null };
-// const SERVICE_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
-// const CHARACTERISTIC_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
-// function setupBLE(io) {
-//   ioRef = io;
-//   noble.on('stateChange', async (state) => {
-//     if (state === 'poweredOn') {
-//       bleStatus.scanning = true;
-//       noble.startScanning([SERVICE_UUID], false);
-//     } else {
-//       noble.stopScanning();
-//       bleStatus.scanning = false;
-//     }
-//   });
-//   noble.on('discover', async (peripheral) => {
-//     if (blePeripheral) return; // Already connected
-//     blePeripheral = peripheral;
-//     noble.stopScanning();
-//     bleStatus.scanning = false;
-//     peripheral.connect((err) => {
-//       if (err) {
-//         bleStatus.error = err.message;
-//         io.emit('device-error', 'BLE connect error: ' + err.message);
-//         return;
-//       }
-//       bleConnected = true;
-//       bleStatus.connected = true;
-//       io.emit('device-status', { online: true, via: 'bluetooth', status: 'ble_connected', timestamp: new Date().toISOString() });
-//       peripheral.discoverSomeServicesAndCharacteristics([SERVICE_UUID], [CHARACTERISTIC_UUID], (err, services, characteristics) => {
-//         if (err || !characteristics.length) {
-//           bleStatus.error = err ? err.message : 'Characteristic not found';
-//           io.emit('device-error', 'BLE discover error: ' + bleStatus.error);
-//           return;
-//         }
-//         bleCharacteristic = characteristics[0];
-//         // Subscribe to notifications
-//         bleCharacteristic.on('data', (data, isNotification) => {
-//           processIncomingBuffer(Buffer.from(data), 'bluetooth');
-//         });
-//         bleCharacteristic.subscribe((err) => {
-//           if (err) io.emit('device-error', 'BLE subscribe error: ' + err.message);
-//         });
-//       });
-//     });
-//     peripheral.on('disconnect', () => {
-//       bleConnected = false;
-//       bleStatus.connected = false;
-//       blePeripheral = null;
-//       bleCharacteristic = null;
-//       io.emit('device-status', { online: false, via: 'bluetooth', status: 'ble_disconnected', timestamp: new Date().toISOString() });
-//       noble.startScanning([SERVICE_UUID], false);
-//       bleStatus.scanning = true;
-//     });
-//   });
-// }
+let blePeripheral = null;
+let bleCharacteristic = null;
+let bleConnected = false;
+let bleStatus = { connected: false, scanning: false, error: null };
+const SERVICE_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
+const CHARACTERISTIC_UUID = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx';
+function setupBLE(io) {
+  ioRef = io;
+  if (!noble) {
+    console.warn('[BLE] noble not available, skipping BLE setup.');
+    return;
+  }
+  noble.on('stateChange', async (state) => {
+    if (state === 'poweredOn') {
+      bleStatus.scanning = true;
+      noble.startScanning([SERVICE_UUID], false);
+    } else {
+      noble.stopScanning();
+      bleStatus.scanning = false;
+    }
+  });
+  noble.on('discover', async (peripheral) => {
+    if (blePeripheral) return; // Already connected
+    blePeripheral = peripheral;
+    noble.stopScanning();
+    bleStatus.scanning = false;
+    peripheral.connect((err) => {
+      if (err) {
+        bleStatus.error = err.message;
+        io.emit('device-error', 'BLE connect error: ' + err.message);
+        return;
+      }
+      bleConnected = true;
+      bleStatus.connected = true;
+      io.emit('device-status', { online: true, via: 'bluetooth', status: 'ble_connected', timestamp: new Date().toISOString() });
+      peripheral.discoverSomeServicesAndCharacteristics([SERVICE_UUID], [CHARACTERISTIC_UUID], (err, services, characteristics) => {
+        if (err || !characteristics.length) {
+          bleStatus.error = err ? err.message : 'Characteristic not found';
+          io.emit('device-error', 'BLE discover error: ' + bleStatus.error);
+          return;
+        }
+        bleCharacteristic = characteristics[0];
+        // Subscribe to notifications
+        bleCharacteristic.on('data', (data, isNotification) => {
+          processIncomingBuffer(Buffer.from(data), 'bluetooth');
+        });
+        bleCharacteristic.subscribe((err) => {
+          if (err) io.emit('device-error', 'BLE subscribe error: ' + err.message);
+        });
+      });
+    });
+    peripheral.on('disconnect', () => {
+      bleConnected = false;
+      bleStatus.connected = false;
+      blePeripheral = null;
+      bleCharacteristic = null;
+      io.emit('device-status', { online: false, via: 'bluetooth', status: 'ble_disconnected', timestamp: new Date().toISOString() });
+      noble.startScanning([SERVICE_UUID], false);
+      bleStatus.scanning = true;
+    });
+  });
+}
 
 function normalizeTransportName(name) {
   if (!name) return undefined;
@@ -554,6 +563,18 @@ function handlePacket({ cmd, payload, len, source }) {
         };
         console.log('[FeedbackInfo] Parsed:', parsed);
         ioRef.emit('feedback-info', parsed);
+        ioRef.emit('device-feedback', parsed); // NEW: emit as 'device-feedback' for new frontend
+        // Save feedback to MongoDB
+        try {
+          const DeviceFeedback = require('../models/DeviceFeedback');
+          DeviceFeedback.create({
+            deviceId: parsed.deviceId || (parsed.source && parsed.source.deviceId) || 'unknown',
+            feedback: parsed,
+            receivedAt: new Date()
+          });
+        } catch (err) {
+          console.error('Failed to save device feedback:', err);
+        }
       } catch (err) {
         console.error('[FeedbackInfo] Error parsing feedback-info payload:', err, 'Payload:', payload.toString('hex'), 'Length:', payload.length);
         ioRef.emit('feedback-info', {
