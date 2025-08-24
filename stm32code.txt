@@ -42,7 +42,7 @@
 #define ERR_LEN_MISMATCH          0x04
 #define ERR_ZERO_QUANTITY         0x05
 
-/*Feedback codes*/
+/Feedback codes/
 #define FEEDBACK_ENABLED               1
 #define FEEDBACK_MAX_ITERATIONS        5
 #define FEEDBACK_TOLERANCE             0.001f    // 3 decimal places (0.001V)
@@ -75,6 +75,8 @@ typedef enum {
 	CMD_FEEDBACK_INFO        = 0x0A,
 	CMD_GET_DETAILED_FEEDBACK = 0x0B,
 	CMD_DETAILED_FEEDBACK     = 0x0C,
+	CMD_AUTO_FEEDBACK_SUMMARY = 0x0D,
+	CMD_AUTO_FEEDBACK_DETAILS = 0x0E,
 } CmdCode_t;
 
 typedef enum {
@@ -106,7 +108,7 @@ typedef struct {
 typedef struct {
     float *vout;
     uint32_t *freq;
-    char **duration;  // Fixed: Should be char** not char*
+    char *duration;  // Fixed: Should be char* not char*
     char **element_symbols;
     uint8_t count;
     uint8_t capacity;
@@ -302,6 +304,9 @@ static uint32_t voltage_to_dac_value(float voltage);
 static float dac_value_to_voltage(uint32_t dac_value);
 static bool perform_voltage_feedback_correction(float target_voltage, FeedbackResult *result, const char *element_symbol);
 static void store_correction_in_history(FeedbackResult *result);
+static void send_auto_feedback_summary(comm_interface_t source_interface);
+static void send_auto_feedback_details(comm_interface_t source_interface);
+
 
 // Debug printing functions
 static void print_device_settings_debug(uint8_t *payload, uint8_t len, comm_interface_t interface);
@@ -437,6 +442,7 @@ static int parse_packet_generic(RingBuffer *rb, PacketParser *parser, UartPacket
     int byte;
     while ((byte = ringbuf_get(rb)) != -1) {
         uint8_t b = (uint8_t)byte;
+
         switch (parser->state) {
             case WAIT_HEADER:
                 if (b == PKT_HEADER) {
@@ -628,13 +634,13 @@ static void handle_command_with_interface(UartPacket *pkt, comm_interface_t sour
             // ACK received - typically no action needed
             break;
 
-        case CMD_GET_FEEDBACK_INFO:
-            handle_get_feedback_info(source_interface);
-            break;
-
-        case CMD_GET_DETAILED_FEEDBACK:  // NEW
-            handle_get_detailed_feedback(source_interface);
-            break;
+//        case CMD_GET_FEEDBACK_INFO:
+//            handle_get_feedback_info(source_interface);
+//            break;
+//
+//        case CMD_GET_DETAILED_FEEDBACK:  // NEW
+//            handle_get_detailed_feedback(source_interface);
+//            break;
 
         default:
             // Unknown command - could log for debugging
@@ -647,9 +653,10 @@ static void handle_get_device_ready(comm_interface_t source_interface)
     config.heartbeat_enabled = false;
     uint8_t status_payload[1] = {STATUS_READY};
     send_packet_to_interface(CMD_DEVICE_IS_READY, status_payload, 1, source_interface);
+    handle_get_feedback_info(source_interface);
 }
 
-static void handle_send_sw_parameters(UartPacket *pkt, comm_interface_t source_interface)
+static void handle_send_sw_paramete rs(UartPacket *pkt, comm_interface_t source_interface)
 {
     TestInput input = {0};
     OutputResult output = {0};
@@ -731,8 +738,39 @@ static void handle_send_sw_parameters(UartPacket *pkt, comm_interface_t source_i
     system_state.stop_current_test = false;
     while (!system_state.stop_current_test) {
         HAL_GPIO_WritePin(GPIOB, LD1_Pin, GPIO_PIN_SET);
+
+        // Store feedback stats before apply_output to track changes
+        uint32_t corrections_before = system_state.feedback_stats.total_corrections;
+
         apply_output(&output);
+
+        // Check if feedback was actually used (only send if feedback was performed)
+        uint32_t corrections_after = system_state.feedback_stats.total_corrections;
+        bool feedback_was_used = (corrections_after > corrections_before) && config.feedback_enabled;
+
         HAL_GPIO_WritePin(GPIOB, LD1_Pin, GPIO_PIN_RESET);
+
+        /HERE - AUTOMATIC FEEDBACK REPORTING/
+        if (feedback_was_used) {
+            // Small delay to ensure all feedback operations are complete
+            HAL_Delay(5);
+
+            // Send automatic feedback summary
+            send_auto_feedback_summary(source_interface);
+
+            // Small delay between packets
+            HAL_Delay(5);
+
+            // Send automatic detailed feedback
+            send_auto_feedback_details(source_interface);
+
+            // Optional: Send debug message
+            char debug_msg[80];
+            snprintf(debug_msg, sizeof(debug_msg),
+                     "Auto feedback sent: %lu corrections this cycle\r\n",
+                     corrections_after - corrections_before);
+            uart_send_to_interface(debug_msg, source_interface);
+        }
 
         check_for_ready_command_stop();
         HAL_Delay(10);
@@ -1399,8 +1437,8 @@ static bool allocate_output_result(OutputResult *output, uint8_t element_count)
     // Allocate arrays
     output->vout = (float*)malloc(sizeof(float) * element_count);
     output->freq = (uint32_t*)malloc(sizeof(uint32_t) * element_count);
-    output->duration = (char**)malloc(sizeof(char*) * element_count);
-    output->element_symbols = (char**)malloc(sizeof(char*) * element_count);  // Allocate memory for element_symbols
+    output->duration = (char*)malloc(sizeof(char) * element_count);
+    output->element_symbols = (char*)malloc(sizeof(char) * element_count);  // Allocate memory for element_symbols
 
     if (!output->vout || !output->freq || !output->duration || !output->element_symbols) {
         free_output_result(output); // Clean up partial allocation
@@ -1494,7 +1532,7 @@ static bool ensure_dac_sequence_capacity(uint8_t required_size)
     }
 
     // Reallocate with new size
-    uint8_t *new_sequence = (uint8_t*)realloc(system_state.dac_sequence,
+    uint8_t new_sequence = (uint8_t)realloc(system_state.dac_sequence,
                                               sizeof(uint8_t) * required_size);
     if (!new_sequence) {
         return false;
@@ -1560,7 +1598,7 @@ static float dac_value_to_voltage(uint32_t dac_value)
 }
 
 /* Feedback correction algorithm -------------------------------------------------------*/
-static bool perform_voltage_feedback_correction(float target_voltage,FeedbackResult *result,const char* element_symbol)
+static bool perform_voltage_feedback_correction(float target_voltage,FeedbackResult result,const char element_symbol)
 {
     last_target_voltage_global = target_voltage;
 
@@ -1700,6 +1738,132 @@ static void store_correction_in_history(FeedbackResult *result)
     if (correction_tracker.history_count < MAX_CORRECTION_HISTORY) {
         correction_tracker.history_count++;
     }
+}
+
+static void send_auto_feedback_summary(comm_interface_t source_interface)
+{
+    uint8_t resp[47]; // Same size as original CMD_FEEDBACK_INFO
+    int pos = 0;
+
+    // Pack feedback configuration
+    resp[pos++] = config.feedback_enabled ? 1 : 0;
+
+    // Pack feedback tolerance (float)
+    memcpy(&resp[pos], &config.feedback_tolerance, sizeof(float));
+    pos += sizeof(float);
+
+    // Pack correction factor as scaled value (0-100)
+    uint8_t correction_factor_scaled = (uint8_t)(FEEDBACK_CORRECTION_FACTOR * 100.0f + 0.5f);
+    resp[pos++] = correction_factor_scaled;
+
+    // Pack max iterations
+    resp[pos++] = FEEDBACK_MAX_ITERATIONS;
+
+    // Pack settle delay (2 bytes)
+    uint16_t settle_delay = FEEDBACK_SETTLE_DELAY_MS;
+    resp[pos++] = (uint8_t)(settle_delay & 0xFF);
+    resp[pos++] = (uint8_t)((settle_delay >> 8) & 0xFF);
+
+    // Pack statistics (all uint32_t values)
+    memcpy(&resp[pos], &system_state.feedback_stats.total_corrections, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.successful_corrections, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.failed_corrections, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.total_iterations, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+
+    // Pack average errors (float values)
+    memcpy(&resp[pos], &system_state.feedback_stats.avg_error_before_correction, sizeof(float));
+    pos += sizeof(float);
+
+    memcpy(&resp[pos], &system_state.feedback_stats.avg_error_after_correction, sizeof(float));
+    pos += sizeof(float);
+
+    // Pack hardware configuration
+    float adc_vref = ADC_VREF;
+    memcpy(&resp[pos], &adc_vref, sizeof(float));
+    pos += sizeof(float);
+
+    uint32_t adc_res = ADC_RESOLUTION;
+    resp[pos++] = (uint8_t)(adc_res & 0xFF);
+    resp[pos++] = (uint8_t)((adc_res >> 8) & 0xFF);
+
+    uint16_t dac_res = DAC_RESOLUTION;
+    resp[pos++] = (uint8_t)(dac_res & 0xFF);
+    resp[pos++] = (uint8_t)((dac_res >> 8) & 0xFF);
+
+    // Pack last target voltage
+    memcpy(&resp[pos], &last_target_voltage_global, sizeof(float));
+    pos += sizeof(float);
+
+    // Calculate and pack success rate percentage
+    uint16_t success_rate_percent = 0;
+    if (system_state.feedback_stats.total_corrections > 0) {
+        success_rate_percent = (uint16_t)(
+            ((float)system_state.feedback_stats.successful_corrections /
+             (float)system_state.feedback_stats.total_corrections) * 10000.0f + 0.5f
+        );
+    }
+    resp[pos++] = (uint8_t)(success_rate_percent & 0xFF);
+    resp[pos++] = (uint8_t)((success_rate_percent >> 8) & 0xFF);
+
+    // Send the packet with new command code
+    send_packet_to_interface(CMD_AUTO_FEEDBACK_SUMMARY, resp, pos, source_interface);
+}
+
+static void send_auto_feedback_details(comm_interface_t source_interface)
+{
+    uint8_t resp[PKT_MAX_PAYLOAD];
+    int pos = 0;
+
+    // Pack number of corrections in history
+    resp[pos++] = correction_tracker.history_count;
+
+    // Pack each correction history entry
+    for (uint8_t i = 0; i < correction_tracker.history_count && pos < PKT_MAX_PAYLOAD - 20; i++) {
+        uint8_t idx = (correction_tracker.history_index - correction_tracker.history_count + i + MAX_CORRECTION_HISTORY) % MAX_CORRECTION_HISTORY;
+        FeedbackResult *hist = &correction_tracker.history[idx];
+
+        // Pack element symbol (2 bytes)
+        resp[pos++] = hist->element_symbol[0];
+        resp[pos++] = hist->element_symbol[1];
+
+        // Pack target voltage (4 bytes)
+        memcpy(&resp[pos], &hist->target_voltage, sizeof(float));
+        pos += sizeof(float);
+
+        // Pack final achieved voltage (4 bytes)
+        memcpy(&resp[pos], &hist->measured_voltage, sizeof(float));
+        pos += sizeof(float);
+
+        // Pack number of iterations (1 byte)
+        resp[pos++] = hist->iterations + 1;
+
+        // Pack each iteration's data
+        for (uint8_t j = 0; j <= hist->iterations && j < FEEDBACK_MAX_ITERATIONS; j++) {
+            // Pack DAC value (2 bytes - compressed from uint32_t)
+            uint16_t dac_compressed = (uint16_t)(hist->dac_steps[j] >> 4);
+            resp[pos++] = dac_compressed & 0xFF;
+            resp[pos++] = (dac_compressed >> 8) & 0xFF;
+
+            // Pack measured voltage (2 bytes - scaled to millivolts)
+            uint16_t mv = (uint16_t)(hist->measured_steps[j] * 1000.0f + 0.5f);
+            resp[pos++] = mv & 0xFF;
+            resp[pos++] = (mv >> 8) & 0xFF;
+
+            if (pos >= PKT_MAX_PAYLOAD - 4) break;
+        }
+
+        if (pos >= PKT_MAX_PAYLOAD - 20) break;
+    }
+
+    // Send the packet with new command code
+    send_packet_to_interface(CMD_AUTO_FEEDBACK_DETAILS, resp, pos, source_interface);
 }
 
 /**
@@ -2319,4 +2483,4 @@ void assert_failed(uint8_t *file, uint32_t line)
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
-#endif /* USE_FULL_ASSERT */
+#endif /* USE_FULL_ASSERT */

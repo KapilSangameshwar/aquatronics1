@@ -8,10 +8,10 @@ exports.getRegisteredDevices = async (req, res) => {
 
 // Register a new device
 exports.registerDevice = async (req, res) => {
-  const { deviceId, customName } = req.body;
+  const { deviceId, customName, latitude, longitude } = req.body;
   if (!deviceId || !customName) return res.status(400).json({ message: 'Device ID and custom name required.' });
   try {
-    const device = new RegisteredDevice({ deviceId, customName });
+    const device = new RegisteredDevice({ deviceId, customName, latitude, longitude });
     await device.save();
     res.status(201).json(device);
   } catch (err) {

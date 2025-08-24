@@ -524,22 +524,28 @@ function handlePacket({ cmd, payload, len, source }) {
           throw new Error('Feedback info payload length is not 47 bytes');
         }
         let pos = 0;
-        const feedback_enabled = payload.readUInt8(pos); pos += 1;
-        const feedback_tolerance = payload.readFloatLE(pos); pos += 4;
-        const correction_factor = payload.readUInt8(pos) / 100.0; pos += 1;
-        const max_iterations = payload.readUInt8(pos); pos += 1;
-        const settle_delay = payload.readUInt16LE(pos); pos += 2;
-        const total_corrections = payload.readUInt32LE(pos); pos += 4;
-        const successful_corrections = payload.readUInt32LE(pos); pos += 4;
-        const failed_corrections = payload.readUInt32LE(pos); pos += 4;
-        const total_iterations = payload.readUInt32LE(pos); pos += 4;
-        const avg_error_before = payload.readFloatLE(pos); pos += 4;
-        const avg_error_after = payload.readFloatLE(pos); pos += 4;
-        const adc_vref = payload.readFloatLE(pos); pos += 4;
-        const adc_res = payload.readUInt16LE(pos); pos += 2;
-        const dac_res = payload.readUInt16LE(pos); pos += 2;
-        const last_target_voltage = payload.readFloatLE(pos); pos += 4;
-        const success_rate_percent = payload.readUInt16LE(pos) / 100.0; pos += 2;
+        let feedback_enabled, feedback_tolerance, correction_factor, max_iterations, settle_delay, total_corrections, successful_corrections, failed_corrections, total_iterations, avg_error_before, avg_error_after, adc_vref, adc_res, dac_res, last_target_voltage, success_rate_percent;
+        try {
+          feedback_enabled = payload.readUInt8(pos); pos += 1;
+          feedback_tolerance = payload.readFloatLE(pos); pos += 4;
+          correction_factor = payload.readUInt8(pos) / 100.0; pos += 1;
+          max_iterations = payload.readUInt8(pos); pos += 1;
+          settle_delay = payload.readUInt16LE(pos); pos += 2;
+          total_corrections = payload.readUInt32LE(pos); pos += 4;
+          successful_corrections = payload.readUInt32LE(pos); pos += 4;
+          failed_corrections = payload.readUInt32LE(pos); pos += 4;
+          total_iterations = payload.readUInt32LE(pos); pos += 4;
+          avg_error_before = payload.readFloatLE(pos); pos += 4;
+          avg_error_after = payload.readFloatLE(pos); pos += 4;
+          adc_vref = payload.readFloatLE(pos); pos += 4;
+          adc_res = payload.readUInt16LE(pos); pos += 2;
+          dac_res = payload.readUInt16LE(pos); pos += 2;
+          last_target_voltage = payload.readFloatLE(pos); pos += 4;
+          success_rate_percent = payload.readUInt16LE(pos) / 100.0; pos += 2;
+        } catch (parseErr) {
+          console.error('[FeedbackInfo] Error parsing fields at pos', pos, parseErr);
+          throw parseErr;
+        }
         const parsed = {
           feedback_enabled: !!feedback_enabled,
           feedback_tolerance,
@@ -567,8 +573,13 @@ function handlePacket({ cmd, payload, len, source }) {
         // Save feedback to MongoDB
         try {
           const DeviceFeedback = require('../models/DeviceFeedback');
+          // Extract deviceId from the first 6 bytes of the payload (as hex string)
+          let deviceId = '';
+          if (payload && payload.length >= 6) {
+            deviceId = payload.slice(0, 6).toString('hex');
+          }
           DeviceFeedback.create({
-            deviceId: parsed.deviceId || (parsed.source && parsed.source.deviceId) || 'unknown',
+            deviceId: deviceId || 'unknown',
             feedback: parsed,
             receivedAt: new Date()
           });
