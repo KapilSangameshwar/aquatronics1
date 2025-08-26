@@ -4,7 +4,7 @@ const TestLog = require('../models/HistoryLog');
 const { authenticate } = require('../middleware/auth');
 
 // GET /api/history/user
-router.get('/user', authenticate, async (req, res) => {
+router.get('/user', async (req, res) => {
   try {
     console.log('🔍 GET /api/history/user called by user:', req.user.id);
     
@@ -56,7 +56,6 @@ router.get('/user', authenticate, async (req, res) => {
 router.get('/all', authenticate, async (req, res) => {
   try {
     console.log('🔍 GET /api/history/all called by user:', req.user.role);
-    
     // Check if user has admin privileges
     if (!['admin', 'superadmin'].includes(req.user.role)) {
       console.log('❌ Access denied for user role:', req.user.role);
@@ -65,22 +64,17 @@ router.get('/all', authenticate, async (req, res) => {
 
     // Parse query parameters for filtering
     const { action, transport, startDate, endDate, userId, limit = 200 } = req.query;
-    
     // Build filter object
     let filter = {};
-    
     if (action) {
       filter.action = { $regex: action, $options: 'i' };
     }
-    
     if (transport) {
       filter.transportMode = transport;
     }
-    
     if (userId) {
       filter.user = userId;
     }
-    
     if (startDate || endDate) {
       filter.timestamp = {};
       if (startDate) filter.timestamp.$gte = new Date(startDate);
@@ -101,12 +95,12 @@ router.get('/all', authenticate, async (req, res) => {
     res.json(logs);
   } catch (err) {
     console.error('❌ Error in /api/history/all:', err);
-    res.status(500).json({ message: 'Failed to fetch all history logs' });
+    res.status(500).json({ message: 'Failed to fetch all history logs', error: err.message, stack: err.stack });
   }
 });
 
 // GET /api/history/user/:userId - for specific user logs (admin only)
-router.get('/user/:userId', authenticate, async (req, res) => {
+router.get('/user/:userId', async (req, res) => {
   try {
     // Check if user has admin privileges or is requesting their own logs
     const requestedUserId = req.params.userId;
@@ -150,7 +144,7 @@ router.get('/user/:userId', authenticate, async (req, res) => {
 });
 
 // GET /api/history/stats - for admin users to get statistics
-router.get('/stats', authenticate, async (req, res) => {
+router.get('/stats', async (req, res) => {
   try {
     // Check if user has admin privileges
     if (!['admin', 'superadmin'].includes(req.user.role)) {
@@ -158,7 +152,6 @@ router.get('/stats', authenticate, async (req, res) => {
     }
 
     const { startDate, endDate } = req.query;
-    
     // Build date filter
     let dateFilter = {};
     if (startDate || endDate) {
@@ -199,6 +192,13 @@ router.get('/stats', authenticate, async (req, res) => {
     console.error(err);
     res.status(500).json({ message: 'Failed to fetch history statistics' });
   }
+});
+
+// Catch-all for /api/history (invalid endpoint)
+router.get('/', (req, res) => {
+  res.status(404).json({
+    message: 'Invalid endpoint. Use /api/history/all or /api/history/user.'
+  });
 });
 
 module.exports = router;

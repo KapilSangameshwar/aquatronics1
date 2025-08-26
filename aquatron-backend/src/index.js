@@ -43,8 +43,10 @@ app.use('/api/history', historyRoutes);
 app.use(errorHandler);
 
 // MongoDB connection
-mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => console.log('MongoDB connected'))
+const dbName = process.env.MONGO_DB_NAME || 'aquatron';
+const mongoUri = process.env.MONGO_URI || `mongodb://localhost:27017/${dbName}`;
+mongoose.connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log(`MongoDB connected to database: ${dbName}`))
   .catch(err => console.error('MongoDB connection error:', err));
 
 // Device communication setup
